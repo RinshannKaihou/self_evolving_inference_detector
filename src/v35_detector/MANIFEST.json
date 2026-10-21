@@ -1,0 +1,20 @@
+{
+ "source": {
+  "repo": "detector_v35",
+  "commit": "e22a7b0c4cc0b22095c5f9bd632831b46c33d66a",
+  "dir": "detector/"
+ },
+ "sha256": {
+  "configs/m4.json": "0f8011c9debe8f57512306f11600dfb14cbc99e457c2810840ee54047f3755f2",
+  "tables/qwen3.npz": "c8d073c73fb5cf5d72773e3a1405ed4274cadd98618b63be953ed020bb873c72",
+  "tables/glm.npz": "5f24ef44474a1b9ac66b83da6eeca3bd2d89b19865b1ef52e1eaf676336d7681",
+  "tables/dsv4.npz": "7759a0ae1b6ecdc92c28bf516f917324707f2fca47ec56f6dcc2bc189574e5fb",
+  "core.py": "b92107a837a7f6f9b1c0b6633bdeae2e069caff58d9386858271417007a32cd8",
+  "offline.py": "e734f0f1d5c77cc2f624f86bb032efda4a76364038437232b12a0651fa8a5cf7",
+  "trees.py": "382732196d2059a9c15b0a174101c0210a010a40cd1cae0a9997c12b62e1761a"
+ },
+ "edited": {
+  "stream.py": "module docstring; RepDetector.__init__ accepts a .npz table path (think_end must then be given)",
+  "vocab.py": "tokenizer paths from the command line instead of the research repo; load() accepts a .npz path"
+ }
+}

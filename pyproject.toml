@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "v35-detector"
+version = "0.1.0"
+description = "Streaming repetition detector for LLM inference outputs (taxonomy v3.5, configuration m4)"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+vocab = ["tokenizers"]
+test = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+v35_detector = ["configs/*.json", "tables/*.npz", "MANIFEST.json"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = ["research: compares with the research repo's saved m4 alerts; skipped when the research repo is not reachable"]

@@ -1,0 +1,10 @@
+._*
+.DS_Store
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+runs/
+v35_h20_results_*.tar.gz

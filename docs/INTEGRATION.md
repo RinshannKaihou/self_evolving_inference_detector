@@ -141,7 +141,7 @@ python bench/online_tpot.py --output runs/tpot_qwen3_8k --model /workspace/model
 ```
 
 - **预计用时**：每个 profile 都要重启一次服务（约 3 分钟）。按 C=1 时 TPOT 约 4.7 ms 估算，1K 一轮约 40 分钟，8K 一轮约 1.5–2 小时（vLLM 原生检查在长输出上会更慢）。时间紧时可以先跑 1K，或改成 `--waves 1`。
-- **交回什么**：每轮的 `results.json`，以及各 profile 目录下的 `server.log`、`v35_events.jsonl`。
+- **交回什么**：每轮的 `results.json`，以及各 profile 目录下的 `server.log`、`v35_events.jsonl`。`collect` 会把它们打成一个包，并生成文字摘要 `runs/summary.txt`（由 `bench/summarize_tpot.py` 生成）。
 - **测量要点**：
   - 两次 baseline 的差，就是这次测试本身的漂移；
   - vLLM 原生检查找到循环时，会提前结束请求，结果里记为 `early_stops`；

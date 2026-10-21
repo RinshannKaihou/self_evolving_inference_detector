@@ -135,16 +135,25 @@ step_tpot() {                                                  # $1: tag; the re
 }
 
 step_collect() {
-  local env="$RUNS/logs/environment.txt" name
+  local env="$RUNS/logs/environment.txt" name f
   {
-    date; hostname; uname -a
+    date; hostname; uname -a; uptime
+    nproc 2>/dev/null || true
+    free -g 2>/dev/null || true
     nvidia-smi 2>/dev/null || true
     lscpu 2>/dev/null | head -20 || true
-    "$PY" -m pip list 2>/dev/null | grep -i -E '^(vllm|torch|numpy|transformers|aiohttp|psutil|v35-detector) ' || true
+    "$PY" -m pip list 2>/dev/null | grep -i -E '^(vllm|torch|numpy|transformers|aiohttp|psutil|setproctitle|v35-detector) ' || true
   } > "$env" 2>&1
+  : > "$RUNS/summary.txt"
+  for f in "$RUNS"/tpot_*/results.json; do
+    [ -f "$f" ] && { "$PY" "$REPO/bench/summarize_tpot.py" "$f" >> "$RUNS/summary.txt" 2>&1 || true; echo >> "$RUNS/summary.txt"; }
+  done
+  [ -f "$RUNS/cpu_bench_h20.json" ] && { echo "== cpu_bench_h20.json =="; cat "$RUNS/cpu_bench_h20.json"; echo; } >> "$RUNS/summary.txt"
+  [ -f "$RUNS/smoke/smoke.txt" ] && { echo "== smoke =="; cat "$RUNS/smoke/smoke.txt"; } >> "$RUNS/summary.txt"
   name="v35_h20_results_$(hostname -s)_$(date +%Y%m%d_%H%M).tar.gz"
   tar czf "$REPO/$name" --exclude='._*' -C "$REPO" runs
   log "结果已打包：$REPO/$name（$(du -h "$REPO/$name" | cut -f1)），请把这个文件传回"
+  log "文字摘要：$RUNS/summary.txt（不方便传文件时，把它的内容贴回即可）"
 }
 
 case "${1:-}" in

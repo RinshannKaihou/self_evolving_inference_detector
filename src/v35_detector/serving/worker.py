@@ -13,6 +13,11 @@ STATS_EVERY_S = 10.0
 
 
 def worker_main(inq, outq, table, config, think_end):
+    try:                                                 # shows as 'v35-detector' in ps / psutil (vLLM ships setproctitle)
+        import setproctitle
+        setproctitle.setproctitle('v35-detector')
+    except ImportError:
+        pass
     try:
         det = RepDetector(table, config, think_end)
     except Exception as e:                               # reported to the parent, which fails at start-up

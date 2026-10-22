@@ -302,4 +302,6 @@ rc4 是研究仓提交 5118334（DESIGN §28，`runs/explore/rc4_report.md`）�
   GLM 0.400、0 条；同一口径下 rc3 的选型方法为 0.584、2 条。
 - **一致性**：本仓 rc4 在全部 19,321 条选型集记录上与研究仓逐条一致（严格档 947 次、监控档 1,179 次，0 处差异）。
 - **资源**（本机）：离线每 token 0.61 μs（rc3 0.78，研究仓 `runs/bench_m4g_rc1_rc2_rc3_rc4.json`）；每进程常驻 21 MB、加载峰值 28 MB
-  （tracemalloc，`bench/cpu_bench.py`；rc3 64 / 118 MB）；每请求状态约 1.3–1.6 KB。线上开销待 H20 实测（适配流程文档 §10.5）。
+  （tracemalloc，`bench/cpu_bench.py`；rc3 64 / 118 MB）；每请求状态约 1.3–1.6 KB。
+  H20 实测（交接包 r4，适配流程文档 §10.5）：时延增量测不出；检测器每 token 2.0–2.4 μs（sync）、3.15 μs（async），同一轮的 rc3 为 4.68 μs；
+  async 检测进程 PSS 43 MB。

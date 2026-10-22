@@ -1,23 +1,33 @@
 #!/usr/bin/env python3
-"""Online TPOT, CPU and memory of the v35 detector inside vLLM, next to vLLM's own repetition check.
+"""Online TPOT, CPU and memory of the v35 detectors inside vLLM: m4 (repetition) next to vLLM's own repetition check, and the
+garbled-output monitor rc3 next to the cost of asking vLLM for logprobs at all.
 
 Slimmed from the previous online tests (v32_online/online_tpot_run.py): one vLLM server per profile, started and stopped
 by this script; every request generates exactly the requested number of tokens (ignore_eos), so all profiles do the same
-work; the detector runs in shadow mode (it detects and logs, never stops a request).
+work; the detectors run in shadow mode (they detect and log, never stop a request).
 
-Profiles
-  baseline, baseline_end    detector off; run first and last to measure the drift of the session
+Profiles (default: the r2 set, marked *; r1 ran baseline, vllm_*, v35_*, baseline_end)
+  baseline, baseline_end *  detectors off, no logprobs; run first and last to measure the drift of the session
+  baseline_logprobs *       every request asks for logprobs=1, detectors off: the cost of logprobs itself (GPU sampler,
+                            engine-to-frontend transfer, the frontend's logprob objects and their JSON in the response)
+  rc3_shadow_sync *         logprobs=1, V35_RARE=shadow (m4 off), sync runner (inside the output-processing loop)
+  rc3_shadow_async *        logprobs=1, V35_RARE=shadow (m4 off), async runner (a separate detector process)
+  m4_rc3_sync *             logprobs=1, V35_DETECTOR=shadow and V35_RARE=shadow, sync runner
+  m4_rc3_async *            logprobs=1, V35_DETECTOR=shadow and V35_RARE=shadow, async runner
   vllm_default              vLLM's check per request, repetition_detection [50,500]x3 (vLLM's default sizes)
   vllm_tuned                vLLM's check per request, [32,2000]x3 (tuned on dev under the same 0.1% cap)
-  v35_sync                  V35_DETECTOR=shadow, sync runner (inside the output-processing loop)
-  v35_async                 V35_DETECTOR=shadow, async runner (a separate detector process)
+  v35_sync                  V35_DETECTOR=shadow, sync runner (no logprobs)
+  v35_async                 V35_DETECTOR=shadow, async runner (no logprobs)
 vLLM's check stops a request when it finds a loop; such requests are counted (early_stops) and their tokens kept.
+The rc3 increment is a logprobs profile against baseline_logprobs; the cost of logprobs is baseline_logprobs against
+baseline (bench/summarize_tpot.py prints both).
 
 Per (profile, output length, concurrency), over timed waves after warm-up waves:
   server TPOT (vllm:request_time_per_output_token_seconds) and ITL (vllm:inter_token_latency_seconds), /metrics deltas;
   client TPOT from SSE chunk arrivals; throughput; CPU seconds of every server process during the wave;
   memory (RSS / PSS / USS) of every server process when ready and after each output length;
-  v35 coverage from its events file: one 'finish' per request with all its tokens, no 'error' event.
+  v35 coverage from its events file: one 'finish' per request with all its tokens, no 'error' event, and with rc3 on,
+  every request checked by rc3 (finish 'rare': 'checked'); logprob profiles: a logprob for every streamed token.
 
   python bench/online_tpot.py --output runs/tpot_qwen3_h20 --model /workspace/models/Qwen3-30B-A3B --table qwen3 --gpu 5
 Needs: the v35 patch applied to this environment's vLLM (integrations/vllm_0_27), `pip install -e <repo>`, aiohttp, psutil,
@@ -35,6 +45,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+from collections import Counter
 from pathlib import Path
 
 import aiohttp
@@ -47,14 +58,21 @@ REQUEST_TPOT = 'vllm:request_time_per_output_token_seconds'
 ITL = 'vllm:inter_token_latency_seconds'
 PREEMPTIONS = 'vllm:num_preemptions_total'
 SAMPLING = dict(temperature=.6, top_k=20, top_p=.95, min_p=0., repetition_penalty=1., frequency_penalty=0., presence_penalty=0.)
-PROFILES = {
-    'baseline': ({'V35_DETECTOR': 'off'}, None),
-    'baseline_end': ({'V35_DETECTOR': 'off'}, None),
-    'vllm_default': ({'V35_DETECTOR': 'off'}, {'min_pattern_size': 50, 'max_pattern_size': 500, 'min_count': 3}),
-    'vllm_tuned': ({'V35_DETECTOR': 'off'}, {'min_pattern_size': 32, 'max_pattern_size': 2000, 'min_count': 3}),
-    'v35_sync': ({'V35_DETECTOR': 'shadow', 'V35_DETECTOR_RUNNER': 'sync'}, None),
-    'v35_async': ({'V35_DETECTOR': 'shadow', 'V35_DETECTOR_RUNNER': 'async'}, None),
+PROFILES = {                                             # name: (server environment, vLLM repetition check, logprobs)
+    'baseline': ({'V35_DETECTOR': 'off'}, None, None),
+    'baseline_logprobs': ({'V35_DETECTOR': 'off'}, None, 1),
+    'rc3_shadow_sync': ({'V35_DETECTOR': 'off', 'V35_RARE': 'shadow', 'V35_DETECTOR_RUNNER': 'sync'}, None, 1),
+    'rc3_shadow_async': ({'V35_DETECTOR': 'off', 'V35_RARE': 'shadow', 'V35_DETECTOR_RUNNER': 'async'}, None, 1),
+    'm4_rc3_sync': ({'V35_DETECTOR': 'shadow', 'V35_RARE': 'shadow', 'V35_DETECTOR_RUNNER': 'sync'}, None, 1),
+    'm4_rc3_async': ({'V35_DETECTOR': 'shadow', 'V35_RARE': 'shadow', 'V35_DETECTOR_RUNNER': 'async'}, None, 1),
+    'baseline_end': ({'V35_DETECTOR': 'off'}, None, None),
+    'vllm_default': ({'V35_DETECTOR': 'off'}, {'min_pattern_size': 50, 'max_pattern_size': 500, 'min_count': 3}, None),
+    'vllm_tuned': ({'V35_DETECTOR': 'off'}, {'min_pattern_size': 32, 'max_pattern_size': 2000, 'min_count': 3}, None),
+    'v35_sync': ({'V35_DETECTOR': 'shadow', 'V35_DETECTOR_RUNNER': 'sync'}, None, None),
+    'v35_async': ({'V35_DETECTOR': 'shadow', 'V35_DETECTOR_RUNNER': 'async'}, None, None),
 }
+R2_PROFILES = ['baseline', 'baseline_logprobs', 'rc3_shadow_sync', 'rc3_shadow_async', 'm4_rc3_sync', 'm4_rc3_async',
+               'baseline_end']
 NOTES = ('A database keeps a write-ahead log so committed changes can be recovered after a crash. Replication improves '
          'availability, but network latency and consistency requirements affect throughput. A cache reduces repeated reads. '
          'Measurements should distinguish warm caches, cold caches, request concurrency, queueing time, and memory usage.\n')
@@ -77,12 +95,15 @@ def prompt_tokens(tokenizer, length, index):
     return prefix + (notes * (count // len(notes) + 1))[:count] + suffix
 
 
-async def request(session, url, prompt, length, index, rep):
+async def request(session, url, prompt, length, index, rep, logprobs=None):
     payload = dict(model='bench', prompt=prompt, max_tokens=length, seed=17 + index, ignore_eos=True, stream=True,
                    stream_options={'include_usage': True}, return_token_ids=True, **SAMPLING)
     if rep is not None:
         payload['repetition_detection'] = rep
+    if logprobs is not None:
+        payload['logprobs'] = logprobs
     start, arrivals, ids, usage, finish, stop_reason = time.perf_counter(), [], [], None, None, None
+    lp_positions = 0
     async with session.post(url + '/v1/completions', json=payload) as response:
         if response.status != 200:
             raise RuntimeError(f'HTTP {response.status}: {(await response.text())[:2000]}')
@@ -99,6 +120,9 @@ async def request(session, url, prompt, length, index, rep):
                 if toks:
                     arrivals.append((time.perf_counter() - start, len(toks)))
                     ids.extend(toks)
+                lp = choice.get('logprobs')
+                if lp:
+                    lp_positions += len(lp.get('token_logprobs') or [])
                 finish = choice.get('finish_reason') or finish
                 stop_reason = choice.get('stop_reason') or stop_reason
     n = len(ids)
@@ -106,16 +130,18 @@ async def request(session, url, prompt, length, index, rep):
         raise RuntimeError(f'token accounting: {n} streamed, usage {usage}')
     if n != length and rep is None:
         raise RuntimeError(f'request {index} produced {n} tokens, expected {length} (ignore_eos)')
+    if logprobs is not None and lp_positions != n:
+        raise RuntimeError(f'request {index}: logprobs for {lp_positions} of {n} tokens (logprobs={logprobs} requested)')
     first, last = arrivals[0][0], arrivals[-1][0]
     return dict(index=index, output_tokens=n, early_stop=n != length, finish_reason=finish, stop_reason=stop_reason,
                 ttft_seconds=first, client_tpot_seconds=(last - first) / (n - 1) if n > 1 else None,
-                chunks=len(arrivals), multi_token_chunks=sum(k > 1 for _, k in arrivals))
+                chunks=len(arrivals), multi_token_chunks=sum(k > 1 for _, k in arrivals), logprob_positions=lp_positions)
 
 
-async def wave(url, prompts, length, indices, rep):
+async def wave(url, prompts, length, indices, rep, logprobs=None):
     timeout = aiohttp.ClientTimeout(total=3600)
     async with aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(limit=len(prompts))) as session:
-        return await asyncio.gather(*(request(session, url, p, length, i, rep) for p, i in zip(prompts, indices)))
+        return await asyncio.gather(*(request(session, url, p, length, i, rep, logprobs) for p, i in zip(prompts, indices)))
 
 
 def processes(pid):
@@ -210,8 +236,9 @@ def read_events(path, offset):
     return [json.loads(x) for x in complete if x], offset + len(data) - len(lines[-1])
 
 
-def wait_coverage(path, offset, responses, timeout=20):
-    """v35 events of one wave: a 'finish' per request with all its tokens, and no 'error'"""
+def wait_coverage(path, offset, responses, rare=False, timeout=20):
+    """v35 events of one wave: a 'finish' per request with all its tokens, no 'error', and with rc3 on, every request
+    checked by rc3"""
     want = sorted(r['output_tokens'] for r in responses)
     events, deadline = [], time.monotonic() + timeout
     while True:
@@ -222,8 +249,11 @@ def wait_coverage(path, offset, responses, timeout=20):
             break
         time.sleep(.2)
     errors = [e for e in events if e['event'] == 'error']
-    return dict(ok=finished == want and not errors, finished_tokens=finished, errors=errors[:5],
-                alerts=sum(e['event'] == 'alert' for e in events)), offset
+    rare_status = Counter(e.get('rare') for e in events if e['event'] == 'finish') if rare else None
+    rare_ok = not rare or set(rare_status) == {'checked'}
+    return dict(ok=finished == want and not errors and rare_ok, finished_tokens=finished, errors=errors[:5],
+                alerts=sum(e['event'] == 'alert' for e in events), rare_status=rare_status,
+                rare_alerts=Counter(e['tier'] for e in events if e['event'] == 'rare_alert')), offset
 
 
 def summarize(report):
@@ -239,10 +269,12 @@ def summarize(report):
                    server_cpu_cores=sum(it['cpu_seconds'] for it in items) / wall,
                    early_stops=sum(r['early_stop'] for r in resp),
                    preemptions=sum(it.get('preemptions') or 0 for it in items),
-                   v35_coverage_ok=all(it['v35'] is None or it['v35']['ok'] for it in items))
+                   v35_coverage_ok=all(it['v35'] is None or it['v35']['ok'] for it in items),
+                   logprobs=PROFILES[profile][2], api_server_cpu_cores=sum(it.get('api_server_cpu_seconds') or 0
+                                                                          for it in items) / wall)
         rows.append(row)
     for row in rows:
-        for base in ('baseline', 'baseline_end'):
+        for base in ('baseline', 'baseline_end', 'baseline_logprobs'):
             b = next((r for r in rows if r['profile'] == base and r['output_length'] == row['output_length']
                       and r['concurrency'] == row['concurrency']), None)
             if b:
@@ -264,10 +296,9 @@ def main():
     ap.add_argument('--model', required=True)
     ap.add_argument('--table', default='qwen3', help='V35_DETECTOR_TABLE for the v35 profiles')
     ap.add_argument('--think-end', default='auto', help='V35_DETECTOR_THINK_END')
-    ap.add_argument('--profiles', nargs='+', default=['baseline', 'vllm_default', 'vllm_tuned', 'v35_sync', 'v35_async',
-                                                       'baseline_end'], choices=list(PROFILES))
+    ap.add_argument('--profiles', nargs='+', default=R2_PROFILES, choices=list(PROFILES))
     ap.add_argument('--concurrencies', type=int, nargs='+', default=[1, 8, 32, 64])
-    ap.add_argument('--output-lengths', type=int, nargs='+', default=[1024, 8192])
+    ap.add_argument('--output-lengths', type=int, nargs='+', default=[1024])
     ap.add_argument('--input-length', type=int, default=1024)
     ap.add_argument('--waves', type=int, default=2)
     ap.add_argument('--warmup-waves', type=int, default=1)
@@ -307,7 +338,7 @@ def main():
             versions[pkg] = None
     report = dict(status='running', started_at=now(), arguments={k: str(v) for k, v in vars(a).items()}, server_command=cmd,
                   sampling=SAMPLING, environment=dict(python=sys.version, platform=platform.platform(), packages=versions),
-                  memory={}, v35_summaries={}, measurements=[], warmups=[], summary=[])
+                  memory={}, server_pids={}, v35_summaries={}, measurements=[], warmups=[], summary=[])
     target = a.output / 'results.json'
 
     def save():
@@ -320,19 +351,22 @@ def main():
     save()
     try:
         for profile in a.profiles:
-            env_extra, rep = PROFILES[profile]
+            env_extra, rep, logprobs = PROFILES[profile]
             folder = a.output / profile
             folder.mkdir()
             events = folder / 'v35_events.jsonl'
             env = {k: v for k, v in os.environ.items() if not k.startswith(('V35_', 'VLLM_STABILITY_'))}
             env.update(CUDA_VISIBLE_DEVICES=a.gpu, OMP_NUM_THREADS='1', **env_extra)
-            if env_extra['V35_DETECTOR'] != 'off':
+            rare = env_extra.get('V35_RARE', 'off') != 'off'
+            detecting = env_extra['V35_DETECTOR'] != 'off' or rare
+            if detecting:
                 env.update(V35_DETECTOR_TABLE=a.table, V35_DETECTOR_THINK_END=a.think_end, V35_DETECTOR_EVENTS=str(events.resolve()))
             print(now(), 'starting', profile, flush=True)
             with open(folder / 'server.log', 'w') as log:
                 proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             try:
                 wait_ready(proc, url)
+                report['server_pids'][profile] = proc.pid       # the API server; EngineCore and the detector are children
                 report['memory'][profile] = {'ready': memory(proc.pid)}
                 expected = metric_total(fetch_metrics(url), REQUEST_TPOT + '_count') or 0
                 if expected:
@@ -346,7 +380,7 @@ def main():
                             prompts = [prompt_tokens(tokenizer, a.input_length, i) for i in indices]
                             before = wait_metric_count(url, expected) if expected else fetch_metrics(url)
                             cpu0, t0 = cpu_seconds(proc.pid), time.perf_counter()
-                            responses = asyncio.run(wave(url, prompts, length, indices, rep))
+                            responses = asyncio.run(wave(url, prompts, length, indices, rep, logprobs))
                             wall = time.perf_counter() - t0
                             cpu1 = cpu_seconds(proc.pid)
                             expected += conc
@@ -360,21 +394,24 @@ def main():
                             preempt = ((metric_total(after, PREEMPTIONS) or 0) - (metric_total(before, PREEMPTIONS) or 0)
                                        if metric_total(after, PREEMPTIONS) is not None else None)
                             cov = None
-                            if env_extra['V35_DETECTOR'] != 'off':
-                                cov, offset = wait_coverage(events, offset, responses)
+                            if detecting:
+                                cov, offset = wait_coverage(events, offset, responses, rare)
                             item = dict(profile=profile, output_length=length, concurrency=conc, wave=wi, started_at=now(),
                                         wall_seconds=wall, responses=responses,
                                         server_tpot_sum=d[REQUEST_TPOT + '_sum'], server_tpot_count=d[REQUEST_TPOT + '_count'],
                                         server_itl_sum=d[ITL + '_sum'], server_itl_count=d[ITL + '_count'],
                                         cpu_seconds=sum(cpu1.get(p, 0) - cpu0.get(p, 0) for p in cpu1),
                                         cpu_seconds_by_pid={str(p): cpu1[p] - cpu0.get(p, 0) for p in cpu1}, v35=cov,
-                                        preemptions=preempt)
+                                        api_server_cpu_seconds=cpu1.get(proc.pid, 0) - cpu0.get(proc.pid, 0),
+                                        preemptions=preempt, logprobs=logprobs)
                             report['warmups' if warm else 'measurements'].append(item)
                             save()
                             tpot = 1e3 * d[REQUEST_TPOT + '_sum'] / max(d[REQUEST_TPOT + '_count'], 1)
                             print(now(), profile, f'len={length} c={conc} wave={wi} server_tpot={tpot:.4f}ms '
                                   f'early_stops={sum(r["early_stop"] for r in responses)} v35={cov and cov["ok"]} '
-                                  f'preemptions={preempt}', flush=True)
+                                  f'preemptions={preempt}' + (f' rc3={dict(cov["rare_status"])} rc3_alerts='
+                                                              f'{dict(cov["rare_alerts"])}' if cov and rare else ''),
+                                  flush=True)
                             if cov is not None and not cov['ok'] and not warm:
                                 raise RuntimeError(f'v35 coverage failed: {cov}')
                     report['memory'][profile][f'after_len{length}'] = memory(proc.pid)

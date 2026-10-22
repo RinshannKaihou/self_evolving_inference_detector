@@ -148,3 +148,193 @@ def test_settings_are_checked_at_start_up(tmp_path):
         hooks.settings({'V35_DETECTOR': 'shadow', 'V35_DETECTOR_TABLE': str(table)})
     s = hooks.settings({'V35_DETECTOR': 'shadow', 'V35_DETECTOR_TABLE': str(table), 'V35_DETECTOR_THINK_END': '151668'})
     assert s['think_end'] == 151668
+
+
+# ------------------------------------------------------------------ rc3 (V35_RARE=shadow): monitor only, needs logprobs
+from typing import NamedTuple  # noqa: E402
+
+from test_rare import _pool, synth as rare_synth  # noqa: E402
+from v35_detector import CONFIG_RC3  # noqa: E402
+from v35_detector import rare as R  # noqa: E402
+from v35_detector.rare_vocab import load as load_rare  # noqa: E402
+
+RC3 = json.load(open(CONFIG_RC3))
+
+
+class LogprobsLists(NamedTuple):                         # vllm/v1/outputs.py (0.27.0): what the hook receives
+    logprob_token_ids: np.ndarray                        # [tokens, 1 + k]: the generated token, then the top-k
+    logprobs: np.ndarray
+    sampled_token_ranks: np.ndarray
+    cu_num_generated_tokens: list = None
+
+
+def lp_rows(tok, top1, chosen, k):
+    """one step's LogprobsLists: k = the batch's largest logprobs (other requests may ask for more than 1)"""
+    n = len(tok)
+    ids = np.zeros((n, k + 1), np.int32)
+    ids[:, 0] = tok
+    vals = np.empty((n, k + 1), np.float32)
+    vals[:, 0], vals[:, 1] = chosen, top1
+    vals[:, 2:] = (top1[:, None] - 1 - np.arange(k - 1)) if k > 1 else vals[:, 2:]
+    return LogprobsLists(ids, vals, np.zeros(n, np.int32))
+
+
+def rare_stream(corpus, seed, n=1500):
+    """an rc3 test stream (float32 logprobs, as vLLM sends them) with planted garble: a lone UTF-8 continuation byte, or a
+    Han token glued to a Latin word in the answer"""
+    T = load_rare(corpus)
+    tok, lp1, lpc = rare_synth(corpus, n, seed, han_share=0.05 * (seed % 3))
+    word = next(int(i) for i in _pool(T, 'latin', True) if T['bytes'][i].decode().strip().isalpha() and len(T['bytes'][i]) > 4)
+    if seed % 3 == 0:
+        tok[700] = next(i for i, b in enumerate(T['bytes']) if b == b'\x80')
+    elif seed % 3 == 1:
+        tok[900], tok[901] = word, int(_pool(T, 'han', False)[seed])
+    return tok, lp1.astype(np.float32).astype(np.float64), lpc.astype(np.float32).astype(np.float64)
+
+
+def rare_service(tmp_path, corpus='qwen3', mode='off', runner='sync', rare='shadow'):
+    env = {'V35_DETECTOR': mode, 'V35_RARE': rare, 'V35_DETECTOR_TABLE': corpus, 'V35_DETECTOR_RUNNER': runner,
+           'V35_DETECTOR_EVENTS': str(tmp_path / f'events_{corpus}_{mode}_{rare}_{runner}.jsonl')}
+    return hooks.Service(hooks.settings(env))
+
+
+def drive(svc, rid, tok, lp1, lpc, rng, with_logprobs=True, sleep=0.0):
+    """engine steps of 1-4 tokens; returns (tokens fed, the stop reason or None)"""
+    svc.register(rid)
+    seen, stop, i = 0, None, 0
+    while i < len(tok):
+        k = int(rng.choice([1, 1, 1, 2, 4]))
+        lps = lp_rows(tok[i:i + k], lp1[i:i + k], lpc[i:i + k], int(rng.integers(1, 6))) if with_logprobs else None
+        stop = svc.feed(rid, tok[i:i + k].tolist(), lps)
+        seen = min(i + k, len(tok))
+        i += k
+        if sleep:
+            time.sleep(sleep)
+        if stop is not None:
+            break
+    svc.finish(rid, 'stop' if stop else 'length')
+    return seen, stop
+
+
+def rare_alerts(ev, rid):
+    return {e['tier']: (e['fired_at'], e['reason']) for e in ev if e['event'] == 'rare_alert' and e['request_id'] == rid}
+
+
+@pytest.mark.parametrize('runner', ['sync', 'async'])
+def test_rare_shadow_equals_offline_and_never_stops(tmp_path, runner):
+    svc = rare_service(tmp_path, runner=runner)
+    want, rng = {}, np.random.default_rng(11)
+    for seed in range(6):
+        tok, lp1, lpc = rare_stream('qwen3', seed)
+        seen, stop = drive(svc, f'r{seed}', tok, lp1, lpc, rng, sleep=0.0001 if runner == 'async' else 0.0)
+        assert stop is None and seen == len(tok)         # rc3 never ends a request
+        want[f'r{seed}'] = {t: R.decide(tok, lp1, lpc, 'qwen3', RC3, tier=tier)
+                            for t, tier in (('strict', 'intercept'), ('monitor', 'monitor'))}
+    svc.close()
+    ev = events(svc)
+    for rid, w in want.items():
+        assert rare_alerts(ev, rid) == {t: v for t, v in w.items() if v[0] >= 0}, rid
+    assert sum(w['strict'][0] >= 0 for w in want.values()) >= 2        # the comparison covered strict alerts
+    assert [e['rare'] for e in ev if e['event'] == 'finish'] == ['checked'] * 6
+    assert not [e for e in ev if e['event'] in ('alert', 'error')]
+    s = [e for e in ev if e['event'] == 'summary'][-1]
+    assert s['counters']['rare_requests'] == 6 and s['counters'].get('intercepts', 0) == 0
+    if runner == 'sync':
+        assert s['rare_seconds_sync'] > 0 and s['detector_seconds_sync'] == 0.0       # m4 off: only rc3 time
+    else:
+        assert s['worker']['rare_tokens'] > 0 and s['worker']['tokens'] == 0
+
+
+def test_requests_without_logprobs_skip_rc3_and_m4_is_unchanged(tmp_path):
+    """m4 intercept with rc3 on: a request without logprobs is not checked by rc3, and m4 stops it exactly where it does
+    with rc3 off"""
+    tok = make('qwen3', 'loop40', 1)
+    at, reason = decide(tok, load('qwen3'), M4, THINK_END['qwen3'])
+    runs = {}
+    for rare in ('off', 'shadow'):
+        svc = rare_service(tmp_path, mode='intercept', rare=rare)
+        lp = np.full(len(tok), -0.05)
+        runs[rare] = drive(svc, 'r1', tok, lp, lp, np.random.default_rng(4), with_logprobs=False)
+        svc.close()
+        ev = events(svc)
+        alert = [(e['fired_at'], e['reason'], e['action']) for e in ev if e['event'] == 'alert']
+        assert alert == [(at, reason, 'intercept')]
+        fin = next(e for e in ev if e['event'] == 'finish')
+        assert fin.get('rare') == (None if rare == 'off' else 'no_logprobs')
+        assert not [e for e in ev if e['event'] in ('rare_alert', 'error')]
+    assert runs['off'] == runs['shadow'] and runs['off'][1] == hooks.STOP_PREFIX + reason
+
+
+@pytest.mark.parametrize('runner', ['sync', 'async'])
+def test_m4_and_rc3_together(tmp_path, runner):
+    """one stream with a loop (m4) and a lone continuation byte (rc3): m4 intercepts at its offline boundary, rc3 logs its
+    offline alert and stops nothing"""
+    T = load_rare('qwen3')
+    tok = make('qwen3', 'loop40', 2)
+    tok[150] = next(i for i, b in enumerate(T['bytes']) if b == b'\x80')
+    at, reason = decide(tok, load('qwen3'), M4, THINK_END['qwen3'])
+    lp1 = np.full(len(tok), -0.01)
+    svc = rare_service(tmp_path, mode='intercept', runner=runner)
+    seen, stop = drive(svc, 'r1', tok, lp1, lp1, np.random.default_rng(6), sleep=0.0002 if runner == 'async' else 0.0)
+    svc.close()
+    ev = events(svc)
+    assert stop == hooks.STOP_PREFIX + reason and (at <= seen < at + 4 if runner == 'sync' else seen >= at)
+    strict = R.decide(tok[:seen], lp1[:seen], lp1[:seen], 'qwen3', RC3)
+    assert strict[1] == 'bad_utf8' and rare_alerts(ev, 'r1')['strict'] == strict
+    assert next(e for e in ev if e['event'] == 'finish')['rare'] == 'checked'
+
+
+def test_rc3_lost_when_logprobs_stop_or_lack_a_top1(tmp_path):
+    svc = rare_service(tmp_path, mode='shadow')
+    tok, lp1, lpc = rare_stream('qwen3', 5, 400)
+    svc.register('a')                                    # logprobs for 100 tokens, then none
+    for i in range(0, 400, 2):
+        svc.feed('a', tok[i:i + 2].tolist(), lp_rows(tok[i:i + 2], lp1[i:i + 2], lpc[i:i + 2], 1) if i < 100 else None)
+    svc.finish('a', 'length')
+    svc.register('b')                                    # logprobs=0: the generated token's logprob only, no top-1 column
+    for i in range(0, 400, 2):
+        only_chosen = LogprobsLists(tok[i:i + 2, None].astype(np.int32), lpc[i:i + 2, None].astype(np.float32), np.zeros(2))
+        svc.feed('b', tok[i:i + 2].tolist(), only_chosen)
+    svc.finish('b', 'length')
+    svc.close()
+    ev = events(svc)
+    assert [e['rare'] for e in ev if e['event'] == 'finish'] == ['lost', 'lost']
+    assert not [e for e in ev if e['event'] == 'error']
+    assert [e for e in ev if e['event'] == 'summary'][-1]['counters']['rare_lost'] == 2
+
+
+def test_rc3_error_fails_open_and_m4_goes_on(tmp_path):
+    tok = make('qwen3', 'loop40', 3)
+    at, reason = decide(tok, load('qwen3'), M4, THINK_END['qwen3'])
+    svc = rare_service(tmp_path, mode='intercept')
+    svc.register('warm')                                 # builds the runner
+    svc.abort('warm')
+
+    def boom(*a):
+        raise RuntimeError('injected')
+
+    svc.runner.rare_feed = boom
+    lp1 = np.full(len(tok), -0.01)
+    seen, stop = drive(svc, 'r1', tok, lp1, lp1, np.random.default_rng(8))
+    svc.close()
+    ev = events(svc)
+    assert [e['where'] for e in ev if e['event'] == 'error'] == ['rare_feed']   # once, then rc3 is off for r1
+    assert stop == hooks.STOP_PREFIX + reason and at <= seen < at + 4
+    assert next(e for e in ev if e['event'] == 'finish')['rare'] == 'error'
+
+
+def test_rare_settings(tmp_path):
+    assert hooks.settings({'V35_RARE': 'off'}) is None
+    with pytest.raises(ValueError):                      # monitor only: no intercept mode
+        hooks.settings({'V35_RARE': 'intercept', 'V35_DETECTOR_TABLE': 'qwen3'})
+    with pytest.raises(ValueError):
+        hooks.settings({'V35_RARE': 'shadow'})
+    table = tmp_path / 'copy.npz'
+    np.savez(table, **load('qwen3'))
+    with pytest.raises(ValueError):                      # rc3 needs a shipped table (rare and reference tables)
+        hooks.settings({'V35_RARE': 'shadow', 'V35_DETECTOR_TABLE': str(table), 'V35_DETECTOR_THINK_END': '151668'})
+    s = hooks.settings({'V35_RARE': 'shadow', 'V35_DETECTOR_TABLE': 'glm'})
+    assert s['mode'] == 'off' and s['rare'] == 'shadow' and s['think_end'] == THINK_END['glm']
+    s = hooks.settings({'V35_DETECTOR': 'shadow', 'V35_RARE': 'shadow', 'V35_DETECTOR_TABLE': 'qwen3',
+                        'V35_DETECTOR_THINK_END': 'none', 'V35_DETECTOR_RUNNER': 'async'})
+    assert s['think_end'] is None and s['runner'] == 'async'

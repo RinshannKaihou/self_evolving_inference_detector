@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""CPU cost per token (one thread) and per-request state of the shipped detector, on the deployment machine's CPU, next to
+"""CPU cost per token (one thread) and per-request state of the shipped detectors, on the deployment machine's CPU, next to
 vLLM's repetition check (upstream transcription, called after every appended token as its scheduler does).
 
 Inputs are the synthetic streams of tests/synth.py (no real trajectories in this repo): a mix of random text, verbatim and
 near-verbatim loops, character runs and circling sentences. The detector is fed 64-token chunks and stops at its first
 alert, as in production. Best of --rounds rounds. The research repo measured the same detector on its real dev records
 (3.43 us/token on an Apple M3 Pro); running this script on both machines translates that figure to the server.
+
+rc3 (garbled-output monitor) gets the same token streams with synthetic logprobs (no real logprobs in this repo). Random
+word sequences put far more tokens through the learned score's gate than real outputs do (rare_gb_gate_share here, about 1%
+on real outputs), so its per-token figure overstates the real cost (research repo, real dev records: 0.76 us/token on an
+Apple M3 Pro). 'hooks' times the whole sync path of serving/hooks.py per token (buffering, 64-token blocks, events) for m4,
+rc3 and both, driven by 1-token engine steps with vLLM-shaped logprobs, as the patched OutputProcessor calls it, on loop-free
+streams with greedy logprobs so that both detectors run to the end of every request (hooks_alerts counts the exceptions).
 
   python bench/cpu_bench.py [--table qwen3] [--rounds 3] [--vllm] [--out runs/cpu_bench.json]
 """
@@ -14,7 +21,10 @@ import json
 import os
 import platform
 import sys
+import tempfile
 import time
+import tracemalloc
+from typing import NamedTuple
 
 import numpy as np
 
@@ -23,8 +33,125 @@ sys.path.insert(0, os.path.join(HERE, '..', 'src'))
 sys.path.insert(0, os.path.join(HERE, '..', 'tests'))
 from synth import KINDS, make  # noqa: E402
 from test_state import state_bytes  # noqa: E402
+from test_rare import synth as rare_synth  # noqa: E402
 from test_vllm_rule import upstream  # noqa: E402
-from v35_detector import CONFIG_M4, RepDetector  # noqa: E402
+from v35_detector import CONFIG_M4, CONFIG_RC3, RareDetector, RepDetector  # noqa: E402
+from v35_detector import rare as R  # noqa: E402
+from v35_detector.serving import hooks  # noqa: E402
+
+LN10 = np.log(10.0)
+NOTE_RC3 = ('rc3 inputs are synthetic: random word sequences with synthetic logprobs put far more tokens through the learned '
+            "score's gate (rare_gb_gate_share) than real outputs (about 1%), so rare_us_per_token overstates the real cost: "
+            'a conservative upper figure (research repo, real dev records: 0.76 us/token on an Apple M3 Pro)')
+
+
+class LogprobsLists(NamedTuple):                         # vllm/v1/outputs.py (0.27.0), as the feed hook receives it
+    logprob_token_ids: np.ndarray
+    logprobs: np.ndarray
+    sampled_token_ranks: np.ndarray
+    cu_num_generated_tokens: list = None
+
+
+def synthetic_logprobs(n, rng):
+    """natural-log top-1 and generated-token logprobs: the generated token is the top-1 at 85% of positions (sampling)"""
+    lp1 = -rng.exponential(0.3, n) * LN10
+    return lp1, np.where(rng.random(n) < 0.85, lp1, lp1 - rng.exponential(1.0, n) * LN10)
+
+
+def run_rare(det, tok, lp1, lpc):
+    st = det.start()
+    fed = 0
+    for i in range(0, len(tok), 64):
+        res = det.feed(st, tok[i:i + 64], lp1[i:i + 64], lpc[i:i + 64])
+        fed = min(i + 64, len(tok))
+        if res is not None:
+            break
+    det.finish(st)
+    return fed, st
+
+
+def rss():
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss
+    except ImportError:
+        return None
+
+
+def bench_rare(table, streams, rounds):
+    rng = np.random.default_rng(0)
+    data = [(tok, *synthetic_logprobs(len(tok), rng)) for _, tok in streams]
+    m0 = rss()
+    tracemalloc.start()                                  # the per-process tables: what stays allocated, and the peak
+    det = RareDetector(table, CONFIG_RC3)
+    run_rare(det, *data[0])                              # first use builds the per-token input table
+    kept, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    m1 = rss()
+    gate = [0, 0]
+    mask = R.gb_gate_mask
+
+    def counted(F):
+        g = mask(F)
+        gate[0] += int(g.sum())
+        gate[1] += len(g)
+        return g
+    R.gb_gate_mask = counted                             # one untimed pass: how many tokens reach the learned score
+    states = [run_rare(det, *d)[1] for d in data]
+    R.gb_gate_mask = mask
+    best, fed_total = None, 0
+    for _ in range(rounds):
+        t0, fed_total = time.perf_counter(), 0
+        for d in data:
+            fed_total += run_rare(det, *d)[0]
+        dt = time.perf_counter() - t0
+        best = dt if best is None else min(best, dt)
+    return dict(rare_us_per_token=1e6 * best / fed_total, rare_tokens_fed=fed_total,
+                rare_gb_gate_share=gate[0] / max(gate[1], 1), rare_state_bytes_max=max(state_bytes(st) for st in states),
+                rare_static_mb=kept / 2 ** 20, rare_load_peak_mb=peak / 2 ** 20,
+                rare_load_rss_mb=None if m0 is None else (m1 - m0) / 2 ** 20, rare_note=NOTE_RC3)
+
+
+def bench_hooks(table, rounds, seeds=4):
+    """us per token of the whole sync hook path (register, 1-token feeds with logprobs, finish) for m4, rc3, both; on
+    streams without loops, so that the detectors run to the end of every request (alerts are counted in the output)"""
+    data = []
+    for s in range(1, seeds + 1):                        # English-like: Latin words, punctuation, digits, a think-end
+        tok, lp1, _ = rare_synth(table, 6000, s, han_share=0.0)
+        lp1 = lp1 / 6                                    # greedy and confident (the research Qwen3 data is greedy): rc3 still
+        rows = [LogprobsLists(np.array([[t, t]], np.int32), np.array([[a, a]], np.float32), np.zeros(1, np.int32))
+                for t, a in zip(tok.tolist(), lp1)]    # scores every gated token, it just rarely fires
+        data.append((tok.tolist(), rows))
+    n = sum(len(t) for t, _ in data)
+    out, alerts = {}, {}
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, m4, rare, with_lp in (('m4', 'shadow', 'off', False), ('m4_logprobs_ignored', 'shadow', 'off', True),
+                                        ('rc3', 'off', 'shadow', True), ('rc3_buffering_only', 'off', 'shadow', True),
+                                        ('m4_rc3', 'shadow', 'shadow', True),
+                                        ('m4_rc3_no_logprobs', 'shadow', 'shadow', False)):
+            svc = hooks.Service(hooks.settings({'V35_DETECTOR': m4, 'V35_RARE': rare, 'V35_DETECTOR_TABLE': table,
+                                                'V35_DETECTOR_EVENTS': os.path.join(tmp, name + '.jsonl')}))
+            if name == 'rc3_buffering_only':             # the hook's own work: the detector is replaced by a no-op
+                svc.register('-')
+                svc.abort('-')
+                svc.runner.rare_start = lambda rid: None
+                svc.runner.rare_feed = lambda rid, ids, top1, chosen: ((), False)
+                svc.runner.rare_finish = lambda rid, ids, top1, chosen: ()
+            best = None
+            for r in range(rounds):
+                t0 = time.perf_counter()
+                for j, (tok, rows) in enumerate(data):
+                    rid = f'{r}-{j}'
+                    svc.register(rid)
+                    for k, t in enumerate(tok):
+                        svc.feed(rid, [t], rows[k] if with_lp else None)
+                    svc.finish(rid, 'length')
+                dt = time.perf_counter() - t0
+                best = dt if best is None else min(best, dt)
+            svc.close()
+            out[name] = 1e6 * best / n
+            alerts[name] = {k: v for k, v in svc.n.items() if k in ('alerts', 'rare_strict', 'rare_monitor')}
+    return dict(hooks_us_per_token=out, hooks_tokens=n, hooks_requests=len(data) * rounds, hooks_alerts=alerts)
 
 
 def run_detector(det, tok):
@@ -64,6 +191,8 @@ def main():
                us_per_token=1e6 * best / fed_total,
                state_bytes_max=max(state_bytes(st) for st in states),
                load_avg_1m=os.getloadavg()[0] if hasattr(os, 'getloadavg') else None)
+    out.update(bench_rare(a.table, streams, a.rounds))
+    out.update(bench_hooks(a.table, a.rounds))
     if a.vllm:
         try:                                             # the installed vLLM's own function, as its scheduler calls it
             from vllm.sampling_params import RepetitionDetectionParams

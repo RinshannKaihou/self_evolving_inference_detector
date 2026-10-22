@@ -10,11 +10,15 @@ Run it with the Python of the vLLM environment:
   python patch_output_processor.py --revert    # removes the hook lines
   --file PATH            patch this file instead of the installed vLLM's
   --allow-version X.Y.Z  accept another vLLM version (the anchors are still checked)
+A file that carries the hook lines of an earlier version of this script (r1: feed without logprobs) is checked and patched
+as its original: --apply replaces the old hook lines.
 
-What the hooks do (src/v35_detector/serving/hooks.py): nothing until V35_DETECTOR is set; then register / feed / finish /
-abort per request. In intercept mode feed() returns a stop reason and the request is finished exactly like a stop string
-(finish_reason 'stop', stop_reason 'v35_repetition: <component>', aborted in the engine core). If the v35_detector
-package is not importable, the patched vLLM behaves as the original.
+What the hooks do (src/v35_detector/serving/hooks.py): nothing until V35_DETECTOR or V35_RARE is set; then register / feed /
+finish / abort per request. feed() gets the step's new token ids and their sample logprobs (EngineCoreOutput.new_logprobs:
+a LogprobsLists [tokens, 1 + the batch's largest logprobs] with the generated token in column 0 and the top-k after it, or
+None when the request did not ask for logprobs). In intercept mode feed() returns a stop reason and the request is finished
+exactly like a stop string (finish_reason 'stop', stop_reason 'v35_repetition: <component>', aborted in the engine core).
+If the v35_detector package is not importable, the patched vLLM behaves as the original.
 """
 import argparse
 import importlib.metadata
@@ -40,11 +44,12 @@ HOOKS = [
      ['        if v35_hooks is not None:',
       '            v35_hooks.register(request_id)']),
     ('feed',                                              # OutputProcessor.process_outputs, after the stop-string check
+                                                          # (before the logprobs processor reads new_logprobs)
      '                if stop_string:\n'
      '                    finish_reason = FinishReason.STOP\n'
      '                    stop_reason = stop_string\n',
      ['                if v35_hooks is not None:',
-      '                    v35_stop = v35_hooks.feed(req_state.request_id, new_token_ids)',
+      '                    v35_stop = v35_hooks.feed(req_state.request_id, new_token_ids, engine_core_output.new_logprobs)',
       '                    if v35_stop is not None and finish_reason is None:',
       '                        finish_reason = FinishReason.STOP',
       '                        stop_reason = v35_stop']),
@@ -104,27 +109,35 @@ def main():
     a = ap.parse_args()
     path, version = (a.file, 'n/a (--file)') if a.file else installed_target(a.allow_version)
     src = open(path, encoding='utf-8').read()
+    base = revert_text(src)                              # the original, also under the hook lines of an earlier version
+    orig = path + '.v35-orig'
     if a.revert:
-        out = revert_text(src)
-        if out == src:
+        if base == src:
             print(f'{path}: no hook lines, nothing to revert')
             return
-        open(path, 'w', encoding='utf-8').write(out)
-        orig = path + '.v35-orig'
-        same = os.path.exists(orig) and open(orig, encoding='utf-8').read() == out
+        open(path, 'w', encoding='utf-8').write(base)
+        same = os.path.exists(orig) and open(orig, encoding='utf-8').read() == base
         print(f'{path}: hook lines removed' + (' (identical to the saved original)' if same else ''))
         return
     try:
-        out = patch_text(src)
+        out = patch_text(base)
     except ValueError as e:
         sys.exit(f'{path}: {e}')
     added = out.count(MARK.strip())
+    state = 'not patched' if base == src else 'patched (current)' if out == src else 'patched by an earlier version'
     if a.check:
-        print(f'{path} (vllm {version}): all {len(HOOKS)} anchors found once; the patch adds {added} lines and compiles')
+        print(f'{path} (vllm {version}): {state}; all {len(HOOKS)} anchors found once; the patch adds {added} lines and compiles')
         return
-    shutil.copy2(path, path + '.v35-orig')
+    if out == src:
+        print(f'{path} (vllm {version}): already patched (current), nothing to do')
+        return
+    if base == src:
+        shutil.copy2(path, orig)
+    elif not os.path.exists(orig):
+        open(orig, 'w', encoding='utf-8').write(base)
     open(path, 'w', encoding='utf-8').write(out)
-    print(f'{path} (vllm {version}): patched, {added} lines added; original kept as {path}.v35-orig')
+    print(f'{path} (vllm {version}): ' + ('patched' if base == src else 'hook lines of an earlier version replaced') +
+          f', {added} hook lines; original kept as {orig}')
 
 
 if __name__ == '__main__':

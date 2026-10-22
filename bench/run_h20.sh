@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# H20 上的接入验证与性能测试（docs/INTEGRATION.md §7 的一键版）。在装有 vLLM 0.27.0 的 Python 环境里运行。
+# H20 上的接入验证与性能测试（docs/INTEGRATION.md §7、§10 的一键版）。在装有 vLLM 0.27.0 的 Python 环境里运行。
+# r2（2026-10-22）：乱码监控 rc3 的在线接入；对照组见 bench/online_tpot.py（R2_PROFILES）。
 #
-#   bash bench/run_h20.sh env       环境检查：Python 依赖、vLLM 版本、旧框架补丁是否还在、v35 补丁状态、GPU 占用
+#   bash bench/run_h20.sh env       环境检查：Python 依赖、vLLM 版本、按 wheel RECORD 逐文件核对 vLLM（只允许 v35 补丁行）、
+#                                   旧框架补丁是否还在、v35 补丁状态、GPU 占用
 #   bash bench/run_h20.sh install   pip install -e（--no-deps）本仓库，并跑单元测试
-#   bash bench/run_h20.sh patch     vLLM 补丁：--check、--apply，再用真实的 output_processor.py 跑补丁测试
-#   bash bench/run_h20.sh smoke     以 intercept 模式起服务，发一个会循环的请求，确认被 v35 拦截，然后关服务
-#   bash bench/run_h20.sh cpu       部署机 CPU 基准（每 token 开销、状态大小、vLLM 原生检查）
-#   bash bench/run_h20.sh tpot1k    在线 TPOT / CPU / 内存：1K 输出，并发 1 8 32 64（约 40 分钟）
-#   bash bench/run_h20.sh tpot8k    在线 TPOT / CPU / 内存：8K 输出，并发 1 8 16（约 1.5–2 小时）
+#   bash bench/run_h20.sh patch     vLLM 补丁：--check、--apply（已打 r1 补丁时替换为本版），再用真实的 output_processor.py 跑补丁测试
+#   bash bench/run_h20.sh smoke     以 intercept + rc3 shadow 起服务：循环请求被 m4 拦截；强制乱码的请求 rc3 报警但不被拦截；
+#                                   不带 logprobs 的请求 rc3 跳过；然后关服务
+#   bash bench/run_h20.sh cpu       部署机 CPU 基准（m4 与 rc3 每 token 开销、钩子整体开销、状态大小、vLLM 原生检查）
+#   bash bench/run_h20.sh tpot1k    在线 TPOT / CPU / 内存：1K 输出，并发 1 8 32 64，7 个 profile（约 30 分钟）
+#   bash bench/run_h20.sh tpot8k    8K 输出，并发 1 8 16（r2 不跑：r1 的 8K 被 ignore_eos 诱发的循环干扰）
 #   bash bench/run_h20.sh collect   把 runs/ 和环境信息打包成 v35_h20_results_<主机>_<时间>.tar.gz（在仓库根目录）
-#   bash bench/run_h20.sh all       依次执行以上各步；任何一步失败都会先打包已有结果再退出
+#   bash bench/run_h20.sh all       依次执行 env install patch smoke cpu tpot1k collect；任何一步失败都会先打包已有结果再退出
 #
 # 变量（用环境变量覆盖）：
 #   PY     vLLM 环境的 python（默认 python）     MODEL  模型目录（默认 /workspace/models/Qwen3-30B-A3B）
@@ -51,7 +54,44 @@ step_env() {
     log "错误：这个环境的 vLLM 还带着旧框架（vllm_stability_monitor）的补丁。请换干净的 vLLM 0.27.0 环境，或先撤掉旧补丁。"
     return 1
   fi
-  if grep -q 'v35-detector hook' "$op"; then echo "v35 补丁：已打" | tee -a "$out"; else echo "v35 补丁：未打" | tee -a "$out"; fi
+  if ! "$PY" - "$REPO" <<'PYEOF' 2>&1 | tee -a "$out"; then
+import base64, hashlib, importlib.metadata as md, importlib.util, os, sys
+spec = importlib.util.spec_from_file_location('p', os.path.join(sys.argv[1], 'integrations', 'vllm_0_27', 'patch_output_processor.py'))
+P = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(P)
+dist = md.distribution('vllm')
+digest = lambda b: base64.urlsafe_b64encode(hashlib.sha256(b).digest()).rstrip(b'=').decode()
+n, bad, op = 0, [], 'unchanged'
+for f in dist.files:
+    if not f.hash or f.hash.mode != 'sha256':
+        continue
+    n += 1
+    try:
+        data = open(f.locate(), 'rb').read()
+    except FileNotFoundError:
+        bad.append(('missing', str(f)))
+        continue
+    if digest(data) == f.hash.value:
+        continue
+    if str(f).replace(os.sep, '/').endswith('vllm/v1/engine/output_processor.py') and \
+            digest(P.revert_text(data.decode('utf-8')).encode('utf-8')) == f.hash.value:
+        op = 'v35 hook lines only'
+        continue
+    bad.append(('changed', str(f)))
+direct = dist.read_text('direct_url.json')
+print(f'vllm RECORD: {n} files checked, {len(bad)} differ; output_processor.py: {op}; installer: '
+      f'{(dist.read_text("INSTALLER") or "?").strip()}; direct_url.json: {"present" if direct else "absent (from an index)"}')
+for b in bad[:20]:
+    print('  RECORD mismatch:', *b)
+sys.exit(1 if bad else 0)
+PYEOF
+    log "错误：vLLM 安装与 wheel 的 RECORD 不一致（见上）。请用干净的 vLLM 0.27.0 环境（见交接说明 §3）。"
+    return 1
+  fi
+  if grep -q 'v35-detector hook' "$op"; then
+    if grep -q 'engine_core_output.new_logprobs' "$op"; then echo "v35 补丁：已打（本版）" | tee -a "$out"
+    else echo "v35 补丁：已打（旧版 r1，patch 步骤会替换）" | tee -a "$out"; fi
+  else echo "v35 补丁：未打" | tee -a "$out"; fi
   [ -x "$(vllm_bin)" ] || { log "错误：找不到 $(vllm_bin)"; return 1; }
   [ -d "$MODEL" ] || { log "错误：模型目录不存在：$MODEL"; return 1; }
   nvidia-smi --query-gpu=index,name,memory.used,utilization.gpu --format=csv | tee -a "$out"
@@ -75,12 +115,10 @@ step_patch() {
   if [ "$FAKE" = 1 ]; then log "FAKE=1：跳过 vLLM 补丁"; return 0; fi
   local op
   op=$(op_file)
-  if grep -q 'v35-detector hook' "$op"; then
-    log "v35 补丁已打过：$op"
-  else
-    "$PY" "$REPO/integrations/vllm_0_27/patch_output_processor.py" --check | tee -a "$RUNS/logs/patch.log"
-    "$PY" "$REPO/integrations/vllm_0_27/patch_output_processor.py" --apply | tee -a "$RUNS/logs/patch.log"
-  fi
+  "$PY" "$REPO/integrations/vllm_0_27/patch_output_processor.py" --check | tee -a "$RUNS/logs/patch.log"
+  "$PY" "$REPO/integrations/vllm_0_27/patch_output_processor.py" --apply | tee -a "$RUNS/logs/patch.log"   # r1 的旧钩子行会被替换
+  grep -q 'v35_hooks.feed(req_state.request_id, new_token_ids, engine_core_output.new_logprobs)' "$op" \
+    || { log "错误：补丁后的 feed 钩子没有传 new_logprobs：$op"; return 1; }
   "$PY" -c 'import vllm.v1.engine.output_processor as m; assert m.v35_hooks is not None; print("patched output_processor imports; v35 hooks loaded")' \
     | tee -a "$RUNS/logs/patch.log"
   if has_pytest; then
@@ -99,10 +137,10 @@ step_smoke() {
     serve="$(vllm_bin) serve $MODEL --served-model-name bench --host 127.0.0.1 --port $PORT --max-model-len 10240"
     serve="$serve --gpu-memory-utilization .85 --tensor-parallel-size $TP $SERVE_ARGS"
   fi
-  V35_DETECTOR=intercept V35_DETECTOR_TABLE="$TABLE" V35_DETECTOR_EVENTS="$dir/events.jsonl" CUDA_VISIBLE_DEVICES="$GPU" \
-    "$PY" "$REPO/bench/smoke_intercept.py" --serve "$serve" --url "http://127.0.0.1:$PORT" --events "$dir/events.jsonl" \
-    --server-log "$dir/server.log" | tee "$dir/smoke.txt"
-  log "拦截冒烟通过"
+  V35_DETECTOR=intercept V35_RARE=shadow V35_DETECTOR_TABLE="$TABLE" V35_DETECTOR_EVENTS="$dir/events.jsonl" \
+    CUDA_VISIBLE_DEVICES="$GPU" "$PY" "$REPO/bench/smoke_intercept.py" --serve "$serve" --url "http://127.0.0.1:$PORT" \
+    --events "$dir/events.jsonl" --server-log "$dir/server.log" --rare --table "$TABLE" | tee "$dir/smoke.txt"
+  log "冒烟通过：m4 拦截；rc3 报警不拦截；无 logprobs 的请求 rc3 跳过"
 }
 
 step_cpu() {
@@ -126,7 +164,7 @@ step_tpot() {                                                  # $1: tag; the re
   if [ "$FAKE" = 1 ]; then
     "$PY" "$REPO/bench/online_tpot.py" --output "$out" --model fake --synthetic-prompts --port "$PORT" \
       --server-cmd "$PY $REPO/bench/fake_vllm_server.py --step-ms 1" --input-length 64 --max-model-len 2048 \
-      --output-lengths 256 --concurrencies 1 4 --waves 1 --warmup-waves 1 2>&1 | tee "$RUNS/logs/tpot_${tag}.log"
+      --table "$TABLE" --output-lengths 256 --concurrencies 1 4 --waves 1 --warmup-waves 1 2>&1 | tee "$RUNS/logs/tpot_${tag}.log"
   else
     "$PY" "$REPO/bench/online_tpot.py" --output "$out" --model "$MODEL" --table "$TABLE" --gpu "$GPU" --port "$PORT" \
       --tensor-parallel-size "$TP" --serve-args "$SERVE_ARGS" "$@" 2>&1 | tee "$RUNS/logs/tpot_${tag}.log"
@@ -166,10 +204,10 @@ case "${1:-}" in
   tpot8k) step_tpot 8k --output-lengths 8192 --concurrencies 1 8 16 ;;
   collect) step_collect ;;
   all)
-    for s in env install patch smoke cpu tpot1k tpot8k; do
+    for s in env install patch smoke cpu tpot1k; do
       log "=== $s ==="
       bash "$0" "$s" || { log "步骤 $s 失败，先打包已有结果"; bash "$0" collect; exit 1; }
     done
     bash "$0" collect ;;
-  *) sed -n '2,22p' "$0"; exit 2 ;;
+  *) sed -n '2,27p' "$0"; exit 2 ;;
 esac

@@ -3,14 +3,19 @@
 
 Per output length and concurrency: server TPOT of the baseline, the session drift (baseline_end - baseline), and every
 other profile's TPOT change against the baseline (us/token); throughput change; server CPU; validity flags (preemptions,
-early stops, v35 coverage). Then the detector's own time per token and the memory of the server processes.
+early stops, v35 coverage). When the logprob profiles ran (r2): the cost of logprobs itself (baseline_logprobs - baseline)
+and the rc3 increment of each rc3 profile (profile - baseline_logprobs), next to the drift, for TPOT, throughput and CPU.
+Then each detector's own time per token and the memory of the server processes.
 
   python bench/summarize_tpot.py runs/tpot_qwen3_1k/results.json [more results.json ...]
 """
 import json
 import sys
 
-ORDER = ['baseline', 'vllm_default', 'vllm_tuned', 'v35_sync', 'v35_async', 'baseline_end']
+ORDER = ['baseline', 'baseline_logprobs', 'rc3_shadow_sync', 'rc3_shadow_async', 'm4_rc3_sync', 'm4_rc3_async',
+         'vllm_default', 'vllm_tuned', 'v35_sync', 'v35_async', 'baseline_end']
+RC3 = ['rc3_shadow_sync', 'rc3_shadow_async', 'm4_rc3_sync', 'm4_rc3_async']
+W = 19
 
 
 def mb(x):
@@ -18,26 +23,52 @@ def mb(x):
 
 
 def proc_mem(snapshot):
-    """API server (the root process), the v35 detector process, and the whole tree; PSS where available, else RSS"""
+    """API server (the root process), the v35 detector process (named v35-detector by setproctitle; without it, the
+    multiprocessing spawn child: EngineCore and vLLM's workers name themselves VLLM::...), and the whole tree; PSS where
+    available, else RSS"""
     if not snapshot:
         return None
     rows = list(snapshot.values())
     val = [r['pss'] if r.get('pss') is not None else r['rss'] for r in rows]
     root = val[0]                                        # memory() lists the root process first
-    det = sum(v for r, v in zip(rows, val) if 'v35-detector' in (r.get('cmdline') or '') + r.get('name', ''))
+    det = sum(v for r, v in zip(rows, val) if any(k in (r.get('cmdline') or '') + r.get('name', '')
+                                                  for k in ('v35-detector', 'multiprocessing.spawn import spawn_main')))
     return root, det, sum(val), rows[0].get('pss') is not None
 
 
 def table(title, rows, profiles, cell):
-    lines = [title, 'len    C  ' + ''.join(f'{p:>14s}' for p in profiles)]
+    lines = [title, 'len    C  ' + ''.join(f'{p:>{W}s}' for p in profiles)]
     for (length, conc), by_prof in sorted(rows.items()):
-        lines.append(f'{length:<5d}{conc:>4d}  ' + ''.join(f'{cell(by_prof.get(p), by_prof):>14s}' for p in profiles))
+        lines.append(f'{length:<5d}{conc:>4d}  ' + ''.join(f'{cell(by_prof.get(p), by_prof):>{W}s}' for p in profiles))
     return lines
+
+
+def detector_lines(prof, s):
+    if not s:
+        return [f'{prof}: no v35 summary (server not stopped cleanly?)']
+    c, w, out = s['counters'], s.get('worker'), []
+    if s.get('mode', 'shadow') != 'off':
+        if w:
+            out.append(f'{prof}: m4 {1e6 * w["detector_seconds"] / max(w["tokens"], 1):.2f} us/token in the detector process '
+                       f'({w["tokens"]} tokens)')
+        else:
+            out.append(f'{prof}: m4 {1e6 * s["detector_seconds_sync"] / max(c.get("tokens", 0), 1):.2f} us/token in the '
+                       f'output loop ({c.get("tokens", 0)} tokens)')
+    if s.get('rare', 'off') != 'off':
+        if w:
+            out.append(f'{prof}: rc3 {1e6 * w.get("rare_seconds", 0) / max(w.get("rare_tokens", 0), 1):.2f} us/token in the '
+                       f'detector process ({w.get("rare_tokens", 0)} tokens)')
+        else:
+            out.append(f'{prof}: rc3 {1e6 * s.get("rare_seconds_sync", 0) / max(c.get("rare_tokens", 0), 1):.2f} us/token in '
+                       f'the output loop ({c.get("rare_tokens", 0)} tokens)')
+    out.append(f'{prof}: counters {c}')
+    return out
 
 
 def summarize(path):
     d = json.load(open(path))
-    out = [f'== {path}  status={d["status"]}  vllm={d["environment"]["packages"].get("vllm")} ==']
+    out = [f'== {path}  status={d["status"]}  vllm={d["environment"]["packages"].get("vllm")}  '
+           f'v35-detector={d["environment"]["packages"].get("v35-detector")} ==']
     rows = {}
     for r in d['summary']:
         rows.setdefault((r['output_length'], r['concurrency']), {})[r['profile']] = r
@@ -54,7 +85,9 @@ def summarize(path):
         return '-' if r is None else f'{r.get("throughput_loss_pct_vs_baseline", float("nan")):+.2f}%'
 
     def cpu(r, by):
-        return '-' if r is None else f'{r["server_cpu_cores"]:.2f}'
+        if r is None:
+            return '-'
+        return f'{r["server_cpu_cores"]:.2f}/{r.get("api_server_cpu_cores", float("nan")):.2f}'
 
     def flags(r, by):
         if r is None:
@@ -68,31 +101,63 @@ def summarize(path):
             bad.append('COV!')
         return ','.join(bad) or 'ok'
 
+    if 'baseline_logprobs' in profiles:
+        out += r2_tables(rows, [p for p in RC3 if p in profiles])
     out += table('server TPOT: baseline absolute; others = change vs baseline (baseline_end = session drift)', rows,
                  profiles, tpot)
     out += table('throughput change vs baseline (positive = slower)', rows, profiles, thr)
-    out += table('server CPU (cores, whole process tree, during the timed waves)', rows, profiles, cpu)
-    out += table('validity: preemptions / early stops (vLLM check) / v35 coverage', rows, profiles, flags)
+    out += table('server CPU (cores during the timed waves): whole process tree / API server process', rows, profiles, cpu)
+    out += table('validity: preemptions / early stops (vLLM check) / v35 coverage (incl. rc3: every request checked)', rows,
+                 profiles, flags)
     for prof, s in (d.get('v35_summaries') or {}).items():
-        if not s:
-            out.append(f'{prof}: no v35 summary (server not stopped cleanly?)')
-            continue
-        if s.get('worker'):
-            w = s['worker']
-            out.append(f'{prof}: detector {1e6 * w["detector_seconds"] / max(w["tokens"], 1):.2f} us/token in the '
-                       f'detector process ({w["tokens"]} tokens); counters {s["counters"]}')
-        else:
-            tok = s['counters'].get('tokens', 0)
-            out.append(f'{prof}: detector {1e6 * s["detector_seconds_sync"] / max(tok, 1):.2f} us/token in the output loop '
-                       f'({tok} tokens); counters {s["counters"]}')
+        out += detector_lines(prof, s)
     out.append('memory (MB; PSS where available, else RSS): API server process / v35-detector process / whole tree')
     for prof in profiles:
         snaps = (d.get('memory') or {}).get(prof) or {}
         for key in sorted(snaps):
             m = proc_mem(snaps[key])
             if m:
-                out.append(f'  {prof:<13s}{key:<15s}{mb(m[0]):>8s}{mb(m[1]):>8s}{mb(m[2]):>8s}{"" if m[3] else "  (RSS)"}')
+                out.append(f'  {prof:<19s}{key:<15s}{mb(m[0]):>8s}{mb(m[1]):>8s}{mb(m[2]):>8s}{"" if m[3] else "  (RSS)"}')
     return '\n'.join(out)
+
+
+def r2_tables(rows, rc3):
+    """the two questions of r2: what logprobs=1 costs by itself, and what rc3 adds on top of it (both next to the drift)"""
+    out = []
+    cols = ['drift', 'logprobs_cost'] + [f'+{p}' for p in rc3]
+
+    def head(title, unit):
+        return [title, f'len    C  {"baseline":>{W}s}' + ''.join(f'{c:>{W}s}' for c in cols) + f'   ({unit})']
+
+    def line(length, conc, base, vals, fmt):
+        return f'{length:<5d}{conc:>4d}  {base:>{W}s}' + ''.join(f'{"-" if v is None else fmt(v):>{W}s}' for v in vals)
+
+    def diff(a, b, key):
+        return None if a is None or b is None else a[key] - b[key]
+
+    for title, key, unit, base_fmt, fmt, scale in (
+            ('r2: server TPOT; logprobs_cost = baseline_logprobs - baseline; +profile = profile - baseline_logprobs '
+             '(rc3 increment); drift = baseline_end - baseline', 'server_tpot_ms', 'us/token',
+             lambda r: f'{r["server_tpot_ms"]:.3f}ms', lambda v: f'{v:+.1f}', 1e3),
+            ('r2: client TPOT, same differences', 'client_tpot_ms', 'us/token', lambda r: f'{r["client_tpot_ms"]:.3f}ms',
+             lambda v: f'{v:+.1f}', 1e3),
+            ('r2: throughput, same differences', 'tokens_per_second', 'tokens/s', lambda r: f'{r["tokens_per_second"]:.1f}',
+             lambda v: f'{v:+.1f}', 1.0),
+            ('r2: server CPU (whole tree), same differences', 'server_cpu_cores', 'cores',
+             lambda r: f'{r["server_cpu_cores"]:.2f}', lambda v: f'{v:+.3f}', 1.0),
+            ('r2: API server process CPU, same differences', 'api_server_cpu_cores', 'cores',
+             lambda r: f'{r["api_server_cpu_cores"]:.2f}', lambda v: f'{v:+.3f}', 1.0)):
+        out += head(title, unit)
+        for (length, conc), by in sorted(rows.items()):
+            b, bl = by.get('baseline'), by.get('baseline_logprobs')
+            vals = [diff(by.get('baseline_end'), b, key), diff(bl, b, key)] + [diff(by.get(p), bl, key) for p in rc3]
+            vals = [None if v is None else v * scale for v in vals]
+            out.append(line(length, conc, '-' if b is None else base_fmt(b), vals, fmt))
+        if key == 'server_tpot_ms':
+            out.append('  logprobs_cost in % of the baseline TPOT: ' + ', '.join(
+                f'len {length} C {conc}: {100 * (by["baseline_logprobs"][key] / by["baseline"][key] - 1):+.2f}%'
+                for (length, conc), by in sorted(rows.items()) if 'baseline' in by and 'baseline_logprobs' in by))
+    return out
 
 
 if __name__ == '__main__':

@@ -1,20 +1,32 @@
 {
  "source": {
   "repo": "detector_v35",
-  "commit": "e22a7b0c4cc0b22095c5f9bd632831b46c33d66a",
-  "dir": "detector/"
+  "commit": "b7bde9c627a42bff23fe7e2bffd4aacf047a0263",
+  "dir": "detector/",
+  "note": "rare_chars rc3 (rare*.py, configs/rc3.json, tables/*_rare.npz, *_rcref.npz, rc3_gb.npz) was copied from the research working tree before it was committed; these are the files frozen by sha256 for rc3's one-shot holdout / external run (research runs/holdout_ledger.jsonl, 2026-10-22)"
  },
  "sha256": {
   "configs/m4.json": "0f8011c9debe8f57512306f11600dfb14cbc99e457c2810840ee54047f3755f2",
   "tables/qwen3.npz": "c8d073c73fb5cf5d72773e3a1405ed4274cadd98618b63be953ed020bb873c72",
   "tables/glm.npz": "5f24ef44474a1b9ac66b83da6eeca3bd2d89b19865b1ef52e1eaf676336d7681",
   "tables/dsv4.npz": "7759a0ae1b6ecdc92c28bf516f917324707f2fca47ec56f6dcc2bc189574e5fb",
+  "configs/rc3.json": "9b734aa40b646b95d31049b19e9d7fb73e8dfe996fa630d2ed05aec8c1a661f7",
+  "tables/qwen3_rare.npz": "06a984c56e5803956197607a9a55ecbea1146833cd8b6d5afa85e48b20b37a76",
+  "tables/glm_rare.npz": "78fff3024ea90f29586e2041d8b88131e8b06285759044d133ee643cac4ff571",
+  "tables/dsv4_rare.npz": "ca04358f53942f9d5edadadf36f294a11f28cdf88e4ad4faa4cc78a460785d23",
+  "tables/qwen3_rcref.npz": "a369774f1fe17ca0cc3e4c6f323586ce4088aacf726d6910bc2735c82ddc1250",
+  "tables/glm_rcref.npz": "a4898f059d6f8593488a87bec19946484eda0a9685b804dddd047030842dabaf",
+  "tables/rc3_gb.npz": "ef0965e5621db3431033f1a588ccb364be8fe8ede1e2a50105ab69007fc29f33",
   "core.py": "b92107a837a7f6f9b1c0b6633bdeae2e069caff58d9386858271417007a32cd8",
   "offline.py": "e734f0f1d5c77cc2f624f86bb032efda4a76364038437232b12a0651fa8a5cf7",
-  "trees.py": "382732196d2059a9c15b0a174101c0210a010a40cd1cae0a9997c12b62e1761a"
+  "trees.py": "382732196d2059a9c15b0a174101c0210a010a40cd1cae0a9997c12b62e1761a",
+  "rare_gb.py": "d1d82e88451c2dfacfd71d9ca68b5593e5d6acd24f3187d90ba2c1b720fee840"
  },
  "edited": {
   "stream.py": "module docstring; RepDetector.__init__ accepts a .npz table path (think_end must then be given)",
-  "vocab.py": "tokenizer paths from the command line instead of the research repo; load() accepts a .npz path"
+  "vocab.py": "tokenizer paths from the command line instead of the research repo; load() accepts a .npz path",
+  "rare.py": "module docstring example; the config's model path ('detector/tables/<file>') resolves to the package's tables/; RareDetector.__init__ accepts a .npz table path (think_end must then be given)",
+  "rare_vocab.py": "relative imports; tokenizer path from the command line; load() accepts a .npz path",
+  "rare_ref.py": "relative imports; the table builder (needs labelled research data) removed, loading unchanged"
  }
 }

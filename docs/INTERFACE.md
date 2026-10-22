@@ -1,6 +1,6 @@
 # 接口说明：v35 检测器（循环输出 m4、乱码监控 rc3）
 
-版本 0.2.0。判定逻辑与研究仓库 `detector_v35` 被评测的版本逐字节相同（`src/v35_detector/MANIFEST.json`）。§1–§8 是循环输出检测器 m4；§9 是乱码检测器 rc3（离线接口，以及同一组 vLLM 钩子上的在线监控）。
+版本 0.3.0。判定逻辑与研究仓库 `detector_v35` 被评测的版本逐字节相同（`src/v35_detector/MANIFEST.json`）。§1–§8 是循环输出检测器 m4；§9 是乱码检测器 rc3（离线接口，以及同一组 vLLM 钩子上的在线监控）。
 
 ## 1. 适用范围
 
@@ -11,7 +11,8 @@
   - 空白或单字符填充。
 - 已评测的模型：Qwen3-8B / 30B-A3B / 32B（思考模式）、GLM-5.3-Flash（思考模式，MTP）、DeepSeek-V4-Flash（非思考模式）。
   - 换模型时阈值不需要重调，只需建词表（见适配流程文档 §5）。
-- 乱码（rare_chars）由另一个检测器 rc3 负责，见 §9。它需要 logprob 输入（vLLM 请求带 `logprobs=1`），只做监控、不拦截。
+- 乱码（rare_chars）由另一个检测器 rc3 负责，见 §9。它需要两个 logprob 输入（top-1 与生成 token 的；在线时由打过补丁的 vLLM 采样器算出，
+  请求不需要带 logprobs），只做监控、不拦截。
 
 ## 2. 安装与依赖
 
@@ -122,7 +123,7 @@ m4 的 14 个组件，以及 `reason` 的字符串：
 | 函数 | 调用时机 | 返回 |
 |---|---|---|
 | `register(request_id)` | 请求进入 OutputProcessor | — |
-| `feed(request_id, token_ids, logprobs=None)` | 每个引擎步的新 token（stop string 检查之后），以及这一步的 `EngineCoreOutput.new_logprobs`（请求没要 logprobs 时为 None，见 §9.7） | m4 拦截模式下报警时返回 `'v35_repetition: <reason>'`，否则 None；rc3 从不返回停止原因 |
+| `feed(request_id, token_ids, rare=None)` | 每个引擎步的新 token（stop string 检查之后），以及这一步的 `EngineCoreOutput.v35_rare`：采样器算出的 rc3 输入，`[top1_0, chosen_0, top1_1, chosen_1, …]`，每 token 两个自然对数 logprob；引擎没采集时为 None（见 §9.7） | m4 拦截模式下报警时返回 `'v35_repetition: <reason>'`，否则 None；rc3 从不返回停止原因 |
 | `finish(request_id, finish_reason)` | 请求以任何原因结束 | — |
 | `abort(request_id)` | 请求被取消，或引擎出错 | — |
 
@@ -131,8 +132,9 @@ m4 的 14 个组件，以及 `reason` 的字符串：
 | 变量 | 取值 | 默认 |
 |---|---|---|
 | `V35_DETECTOR` | m4：`off` / `shadow`（只检测、记日志）/ `intercept`（检测、记日志并结束请求） | `off` |
-| `V35_RARE` | rc3：`off` / `shadow`（只检测、记日志；没有拦截模式）。只检查带 logprobs（≥ 1）的请求，见 §9.7 | `off` |
-| `V35_DETECTOR_TABLE` | `qwen3` / `glm` / `dsv4` / `.npz` 路径（m4 词表）；rc3 只接受内置名 | 任一检测器开启时必填 |
+| `V35_RARE` | rc3：`off` / `collect`（采样器采集并送到前端，只记覆盖，不跑 rc3）/ `shadow`（采集，跑 rc3，只记日志；没有拦截模式）。EngineCore 进程读同一个变量决定采样器是否采集，见 §9.7 | `off` |
+| `V35_RARE_TRACE` | N > 0 时，每个请求前 N 个 token 收到的值写进 `rare_trace` 事件（冒烟测试用来与 vLLM 返回的 logprobs 对比） | `0` |
+| `V35_DETECTOR_TABLE` | `qwen3` / `glm` / `dsv4` / `.npz` 路径（m4 词表）；rc3 只接受内置名 | m4 开启或 `V35_RARE=shadow` 时必填（只 `collect` 时不需要） |
 | `V35_DETECTOR_THINK_END` | `auto` / `none` / token id（两个检测器共用） | `auto` |
 | `V35_DETECTOR_RUNNER` | `sync`（在输出处理循环里算）/ `async`（独立检测进程）；两个检测器在同一处算 | `sync` |
 | `V35_DETECTOR_CONFIG` | m4 配置 JSON 路径（rc3 固定用内置 rc3） | 内置 m4 |
@@ -144,11 +146,12 @@ m4 的 14 个组件，以及 `reason` 的字符串：
 |---|---|---|
 | `alert` | `request_id`、`fired_at`、`reason`、`tokens_seen`、`action`（`shadow` / `intercept`）；或 `after_end: true` | m4 报警。`after_end` 表示请求已经结束（最后不满一块的判定，或异步结果晚到） |
 | `rare_alert` | `request_id`、`tier`（`monitor` / `strict`）、`fired_at`、`reason`（rc3 的规则）、`tokens_seen`、`action`（`shadow`）；或 `after_end: true` | rc3 报警，见 §9.7。每个请求每档至多一行；从不结束请求 |
-| `finish` | `request_id`、`tokens`、`finish_reason`；开启 rc3 时另有 `rare`（rc3 对该请求的覆盖，见 §9.7） | 每个请求结束 |
+| `finish` | `request_id`、`tokens`、`finish_reason`；开启 rc3（collect 或 shadow）时另有 `rare`（rc3 对该请求的覆盖，见 §9.7） | 每个请求结束 |
+| `rare_trace` | `request_id`、`token_ids`、`top1`、`chosen`（前 N 个 token 收到的值） | 只在 `V35_RARE_TRACE` > 0 时，请求结束时写 |
 | `error` | `request_id`、`where`、`error` | 检测器出错。该检测器对该请求停止检测，另一个检测器与服务照常进行。`where` 以 `rare` 开头的是 rc3 |
 | `summary` | `counters`、`detector_seconds_sync`（m4）、`worker`、`open_requests`；开启 rc3 时另有 `rare`、`rare_seconds_sync`（rc3），`worker` 里另有 `rare_tokens`、`rare_seconds`、`rare_open_requests` | 每 10 秒（随请求结束时检查）以及进程退出时 |
 
-`counters` 里 rc3 相关的计数：`rare_requests`（rc3 检查的请求）、`rare_no_logprobs`（没要 logprobs、rc3 跳过的请求）、`rare_lost`（中途没了 logprobs 的请求）、`rare_tokens`（前端交给 rc3 的 token 数；sync 时严格档报警后不再计，async 时是入队数，检测进程实际处理的数在 `worker.rare_tokens`）、`rare_monitor` / `rare_strict`（两档报警数）。
+`counters` 里 rc3 相关的计数：`rare_requests`（有值、rc3 覆盖的请求）、`rare_no_values`（引擎没送值、rc3 没有检查的请求）、`rare_lost`（值中途断了的请求）、`rare_values`（带着值到达的 token 数）、`rare_tokens`（前端交给 rc3 的 token 数，只 shadow；sync 时严格档报警后不再计，async 时是入队数，检测进程实际处理的数在 `worker.rare_tokens`）、`rare_monitor` / `rare_strict`（两档报警数）。
 
 **出错时放行（fail-open）**：检测器出任何错，都只会让该请求停止检测；异步进程挂掉或队列满，只影响相关请求。服务本身不会因为检测器出错而失败。
 
@@ -185,7 +188,7 @@ mon = det.monitor(st)                                      # 监控档的首次�
 | `think_end` | 同 m4：回答段起点的 token id；`'auto'` 只适用于内置词表；`None` 表示非思考模式 |
 | `token_ids` | 生成的 token id，任意块大小 |
 | `top1_logprob` | 每个位置 top-1 候选的 logprob，**自然对数**（vLLM 返回的单位） |
-| `chosen_logprob` | 每个位置生成 token 自己的 logprob，自然对数。vLLM `logprobs=1` 时两者都会返回 |
+| `chosen_logprob` | 每个位置生成 token 自己的 logprob，自然对数。vLLM `logprobs=1` 时两者都会返回；在线时由打过补丁的采样器算出（§9.7） |
 
 `Result` 与 m4 相同：`is_ill`、`fired_at`、`reason`（触发的规则，如 `bad_utf8`）。
 
@@ -209,10 +212,10 @@ mon = det.monitor(st)                                      # 监控档的首次�
 
 | 项 | 数值 | 说明 |
 |---|---|---|
-| 每 token CPU | 0.76 μs | 单线程，Apple M3 Pro，负载 6.4，真实 dev 记录（研究仓库 `tools/bench.py`）；服务器上待 r2 实测 |
-| 钩子开销 | 每 token 约 0.5 μs（Mac） | 在线时钩子自己缓冲 logprob、按 64 个一块交给 rc3 的开销，不含 rc3 本身（`bench/cpu_bench.py` 的 `rc3_buffering_only`） |
+| 每 token CPU | 0.76 μs（Mac 离线）；H20 线上 3.7–4.3 μs | Mac：单线程，Apple M3 Pro，负载 6.4，真实 dev 记录（研究仓库 `tools/bench.py`）。H20：交接包 r2 在真实生成流上实测（Xeon 8558P） |
+| 钩子开销 | 每 token 约 0.5 μs（Mac）、0.69 μs（H20） | 在线时钩子自己缓冲 logprob、按 64 个一块交给 rc3 的开销，不含 rc3 本身（`bench/cpu_bench.py` 的 `rc3_buffering_only`） |
 | 每请求状态 | 约 1.3 KB | 有上界，不随输出长度增长（`tests/test_rare.py`）；在线时另缓冲不满 64 个的 token id 与两个 logprob |
-| 静态内存 | 每个进程常驻约 64 MB（qwen3 63.8 MB、glm 65.1 MB），加载时峰值约 118 MB | tracemalloc 实测（2026-10-22），参照表 51 MB 加乱码词表与学习打分。研究仓库与本文档此前写的"约 33 MB"偏低。磁盘上参照表 1.3–1.4 MB、模型 0.56 MB。sync 时在 API server 进程里，async 时在检测进程里 |
+| 静态内存 | 每个进程常驻约 64 MB（qwen3 63.8 MB、glm 65.1 MB），加载时峰值约 118 MB | tracemalloc 实测（2026-10-22），参照表 51 MB 加乱码词表与学习打分。研究仓库与本文档此前写的"约 33 MB"偏低。磁盘上参照表 1.3–1.4 MB、模型 0.56 MB。sync 时在 API server 进程里，async 时在检测进程里。H20 实测 PSS：sync 时 API server 多 71–82 MB，async 时检测进程 102–105 MB |
 
 ### 9.6 评测结果（严格档，研究仓库 `detector_v35` 的评测）
 
@@ -234,39 +237,48 @@ rc3 与 m4 用同一组钩子（§8），由 `V35_RARE` 单独开关：
 ```bash
 V35_RARE=shadow V35_DETECTOR_TABLE=qwen3 V35_DETECTOR_EVENTS=/var/log/v35-events.jsonl vllm serve ...   # 只开 rc3
 V35_DETECTOR=intercept V35_RARE=shadow V35_DETECTOR_TABLE=qwen3 ... vllm serve ...                     # m4 拦截 + rc3 监控
+V35_RARE=collect V35_DETECTOR_EVENTS=... vllm serve ...                                               # 只采集、不跑 rc3（测成本用）
 ```
 
-- **只监控**：`V35_RARE` 只有 `off` / `shadow`，rc3 的报警只写事件日志（`rare_alert`），`feed` 永远不会因为 rc3 返回停止原因。
-- **输入**：补丁在 feed 钩子里把这一步的 `EngineCoreOutput.new_logprobs` 原样交给 `feed`。vLLM 0.27.0 里它是 `LogprobsLists`：
-  - `.logprobs` 是 `[本步 token 数, 1 + k]` 的 float32 数组，第 0 列是生成 token 的 logprob，第 1 列起是 top-k（降序）；
-  - k 是同一批里所有请求 `logprobs` 的最大值，所以列数可能多于本请求要的；rc3 只读第 0、1 列；
-  - 请求没带 `logprobs` 时它是 None。
+- **只监控**：`V35_RARE` 没有拦截模式，rc3 的报警只写事件日志（`rare_alert`），`feed` 永远不会因为 rc3 返回停止原因。
+- **输入从哪来（0.3.0，交接包 r3）**：打过补丁的 vLLM 采样器（`integrations/vllm_0_27/patch_vllm.py`，适配流程文档 §4、§10.2）
+  在 `V35_RARE` 为 `collect` / `shadow` 时，对批里每一行在采样后算出原始分布的两个 logprob（`v35_detector/serving/collect.py` 的两个 Triton 核：
+  `top1 = M − lse`、`chosen = x_c − lse`，float32），经 `ModelRunnerOutput.v35_rare` → `EngineCoreOutput.v35_rare` 送到 feed 钩子：
+  - `EngineCoreOutput.v35_rare` 是 `[top1_0, chosen_0, top1_1, chosen_1, …]`（Python float，每 token 两个），没有值时为 None；
+  - **与请求要不要 logprobs 无关**：每个请求都有值；请求要 logprobs 时，客户端拿到的仍是 vLLM 原本的结果，值不经过 logprobs 通道；
+  - EngineCore 进程从 API server 继承 `V35_RARE`；`off` 时采样器不做任何额外的 GPU 工作。
+  - 0.2.0（r2）读的是请求自己的 logprobs（`EngineCoreOutput.new_logprobs`）。r3 不再保留它作为后备（理由见适配流程文档 §10.2 第 6 条）。
 - **哪些请求会被检查**：请求的第一批 token 决定。
-  - 带 `logprobs` ≥ 1：rc3 检查整条输出；
-  - 没带 `logprobs`：rc3 跳过该请求（`finish` 的 `rare` 为 `no_logprobs`），m4 照常；
-  - `logprobs=0`（只有生成 token 的 logprob、没有 top-1）或中途 logprobs 不再出现：rc3 对该请求停止（`lost`）。
-- **logprob 的口径**：rc3 按 vLLM 默认的 `--logprobs-mode raw_logprobs`（模型原始分布，温度、top-k/top-p 之前）评测；
-  研究侧 Qwen3 数据是 greedy、GLM / DeepSeek 是 T=1 采样，与原始分布一致。服务端改成 `processed_*` 后数值口径不同，阈值不再对应评测结果。
-- **分块**：token 与两个 logprob 一起按 64 个一块交给 rc3（async 时一起入队），报警与离线 `rare.decide` 一致，与引擎每步出几个 token 无关
+  - 第一批带着值：rc3 检查整条输出（`collect` 只记覆盖）；
+  - 第一批没有值：rc3 不检查该请求（`no_values`），m4 照常。在 0.27.0 里这发生在：补丁没打全、EngineCore 进程的 `V35_RARE` 是 off、
+    模型走了 V2 model runner（0.27.0 稠密模型的默认，采样器不同，没有补丁）；
+  - 中途某一步没有值，或值的个数不是 token 数的两倍：rc3 对该请求停止（`lost`）。投机解码有草稿的步走 rejection sampler，r3 不采集，
+    所以 MTP 下的请求会在第一个草稿步记 `lost`；采样器那一步采集出错（server.log 有 `v35 rc3 collection failed`）也会这样。
+- **logprob 的口径**：原始 logits 的 log-softmax，即 vLLM 默认 `--logprobs-mode raw_logprobs` 的口径（allowed-token 掩码、bad words、
+  logit bias、惩罚、温度、top-k/top-p 之前；结构化输出的 bitmask 在采样器之前，包含在内）。rc3 就是按这个口径评测的；
+  研究侧 Qwen3 数据是 greedy、GLM / DeepSeek 是 T=1 采样，与原始分布一致。r3 的值与 `--logprobs-mode` 的设置无关。
+- **分块**：token 与两个值一起按 64 个一块交给 rc3（async 时一起入队），报警与离线 `rare.decide` 一致，与引擎每步出几个 token 无关
   （`tests/test_serving.py`）。
 - **`finish` 事件的 `rare` 字段**：
 
 | 值 | 含义 |
 |---|---|
-| `checked` | rc3 检查了全部 token（或检查到严格档报警为止） |
-| `no_logprobs` | 请求没带 logprobs，rc3 没有检查 |
-| `lost` | 中途没了 logprobs，或只有生成 token 的 logprob（`logprobs=0`）；rc3 从那里起停止 |
+| `checked` | 每个 token 都带着值；`shadow` 时 rc3 检查了全部 token（或检查到严格档报警为止） |
+| `no_values` | 引擎没有送值（见上），rc3 没有检查 |
+| `lost` | 值中途断了（投机解码、采集出错，或值的个数不对）；rc3 从那里起停止 |
 | `error` | rc3 出错（另有 `error` 事件）；从那里起停止，m4 不受影响 |
 | `none` | 没有 token，或检测不可用（async 检测进程不在） |
 
 - **`rare_alert`**：`tier` 为 `monitor`（监控档首次报警，含全部规则）或 `strict`（严格档首次报警，之后 rc3 对该请求结束）。
   `fired_at` 是报警时已消费的 token 数（rc3 晚一个 token，见 §9.3）；在线时报警在该 token 所在的 64 块交给 rc3 时写出，
   请求结束后才判出的写 `after_end: true`。
-- **出错时放行**：rc3 出错只让 rc3 对该请求停止，m4 与服务照常。
-- **`V35_RARE=off` 时**：钩子多读一个属性、多做一次布尔判断，m4 的代码路径与 H20 r1 实测的相同（`bench/cpu_bench.py` 的 `m4` 与
-  `m4_logprobs_ignored` 两项相同）。
-- **开销**：打开 logprobs 本身的开销（GPU 采样多算 log-softmax 与 top-k、进程间传输、前端整理 logprob 与响应里的 JSON）和 rc3 的增量，
-  都还没在 H20 上测过；测试方案见适配流程文档 §10（交接包 r2）。
-- **已知限制**：
-  - 同一批里有请求用 `logprob_token_ids`（generative scoring 接口）时，vLLM 整批改返回指定 token 的 logprob，第 1 列不再是 top-1；
-  - 投机解码（MTP）下每步多个 token，块缓冲照样成立，但没有在线验证。
+- **出错时放行**：rc3 出错只让 rc3 对该请求停止，m4 与服务照常；采集出错只让那一步没有值，采样照常。
+- **`V35_RARE=off` 时**：采样器只多一次 `is not None` 判断，model runner 与调度器各多读一个属性（不存在），`EngineCoreOutput.v35_rare`
+  为 None、编码里省略；钩子多读一个属性、多做一次布尔判断，m4 的代码路径与 H20 r1 实测的相同（`bench/cpu_bench.py` 的 `m4` 与
+  `m4_values_ignored` 两项相同）。
+- **开销**：
+  - r2（适配流程文档 §10.3）：rc3 本身的 TPOT 增量测不出，检测器每 token 3.7–4.3 μs；主要成本在取数：请求带 `logprobs=1`
+    走 vLLM 自带的 logprobs 路径，TPOT 增加 1.3–3.1%。
+  - r3（适配流程文档 §10.4）：采样器采集的成本是 collect_only − baseline，待 H20 实测；9 月 v3.1 的采样器 Triton top-1 采集
+    实测 C=1 +26、C=8 +15 μs/token（含当时的检测器）。钩子收值、不跑 rc3 的前端开销在 `bench/cpu_bench.py` 的 `rc3_collect` 一项。
+- **已知限制**：只接 V1 GPU model runner；投机解码不采集（`lost`）；张量并行、流水线并行没有在线验证。

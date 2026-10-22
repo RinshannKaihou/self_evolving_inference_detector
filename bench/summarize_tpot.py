@@ -3,18 +3,21 @@
 
 Per output length and concurrency: server TPOT of the baseline, the session drift (baseline_end - baseline), and every
 other profile's TPOT change against the baseline (us/token); throughput change; server CPU; validity flags (preemptions,
-early stops, v35 coverage). When the logprob profiles ran (r2): the cost of logprobs itself (baseline_logprobs - baseline)
-and the rc3 increment of each rc3 profile (profile - baseline_logprobs), next to the drift, for TPOT, throughput and CPU.
-Then each detector's own time per token and the memory of the server processes.
+early stops, v35 coverage). r3 (collect_only ran): the collection cost (collect_only - baseline: sampler kernels and
+transport), the rc3 increment of each rc3 profile (profile - collect_only), and vLLM's own logprobs path, r2's way of
+getting the same inputs (baseline_logprobs - baseline), next to the drift, for server / client TPOT, throughput and CPU.
+r2 results (rc3_shadow_* profiles) get r2's tables. Then each detector's own time per token and the memory of the server
+processes.
 
   python bench/summarize_tpot.py runs/tpot_qwen3_1k/results.json [more results.json ...]
 """
 import json
 import sys
 
-ORDER = ['baseline', 'baseline_logprobs', 'rc3_shadow_sync', 'rc3_shadow_async', 'm4_rc3_sync', 'm4_rc3_async',
-         'vllm_default', 'vllm_tuned', 'v35_sync', 'v35_async', 'baseline_end']
-RC3 = ['rc3_shadow_sync', 'rc3_shadow_async', 'm4_rc3_sync', 'm4_rc3_async']
+ORDER = ['baseline', 'collect_only', 'rc3_sync', 'rc3_async', 'baseline_logprobs', 'rc3_shadow_sync', 'rc3_shadow_async',
+         'm4_rc3_sync', 'm4_rc3_async', 'vllm_default', 'vllm_tuned', 'v35_sync', 'v35_async', 'baseline_end']
+RC3 = ['rc3_shadow_sync', 'rc3_shadow_async', 'm4_rc3_sync', 'm4_rc3_async']      # r2
+RC3_R3 = ['rc3_sync', 'rc3_async', 'm4_rc3_sync', 'm4_rc3_async']
 W = 19
 
 
@@ -54,7 +57,10 @@ def detector_lines(prof, s):
         else:
             out.append(f'{prof}: m4 {1e6 * s["detector_seconds_sync"] / max(c.get("tokens", 0), 1):.2f} us/token in the '
                        f'output loop ({c.get("tokens", 0)} tokens)')
-    if s.get('rare', 'off') != 'off':
+    if s.get('rare', 'off') == 'collect':
+        out.append(f'{prof}: rc3 collect only: sampler values for {c.get("rare_values", 0)} tokens, '
+                   f'{c.get("rare_requests", 0)} requests')
+    elif s.get('rare', 'off') != 'off':
         if w:
             out.append(f'{prof}: rc3 {1e6 * w.get("rare_seconds", 0) / max(w.get("rare_tokens", 0), 1):.2f} us/token in the '
                        f'detector process ({w.get("rare_tokens", 0)} tokens)')
@@ -101,7 +107,9 @@ def summarize(path):
             bad.append('COV!')
         return ','.join(bad) or 'ok'
 
-    if 'baseline_logprobs' in profiles:
+    if 'collect_only' in profiles:
+        out += r3_tables(rows, [p for p in RC3_R3 if p in profiles])
+    elif 'baseline_logprobs' in profiles:
         out += r2_tables(rows, [p for p in RC3 if p in profiles])
     out += table('server TPOT: baseline absolute; others = change vs baseline (baseline_end = session drift)', rows,
                  profiles, tpot)
@@ -119,6 +127,43 @@ def summarize(path):
             if m:
                 out.append(f'  {prof:<19s}{key:<15s}{mb(m[0]):>8s}{mb(m[1]):>8s}{mb(m[2]):>8s}{"" if m[3] else "  (RSS)"}')
     return '\n'.join(out)
+
+
+def r3_tables(rows, rc3):
+    """r3: what collecting rc3's inputs in the sampler costs, what rc3 adds on top, and r2's way (vLLM's logprobs path) for
+    comparison, all next to the drift"""
+    out = []
+    cols = ['drift', 'collect'] + [f'+{p}' for p in rc3] + ['logprobs_path']
+
+    def diff(a, b, key):
+        return None if a is None or b is None else a[key] - b[key]
+
+    for title, key, unit, base_fmt, fmt, scale in (
+            ('r3: server TPOT; drift = baseline_end - baseline; collect = collect_only - baseline (sampler kernels + '
+             'transport); +profile = profile - collect_only (rc3 increment); logprobs_path = baseline_logprobs - baseline '
+             "(r2's way)", 'server_tpot_ms', 'us/token', lambda r: f'{r["server_tpot_ms"]:.3f}ms', lambda v: f'{v:+.1f}',
+             1e3),
+            ('r3: client TPOT, same differences', 'client_tpot_ms', 'us/token', lambda r: f'{r["client_tpot_ms"]:.3f}ms',
+             lambda v: f'{v:+.1f}', 1e3),
+            ('r3: throughput, same differences', 'tokens_per_second', 'tokens/s', lambda r: f'{r["tokens_per_second"]:.1f}',
+             lambda v: f'{v:+.1f}', 1.0),
+            ('r3: server CPU (whole tree), same differences', 'server_cpu_cores', 'cores',
+             lambda r: f'{r["server_cpu_cores"]:.2f}', lambda v: f'{v:+.3f}', 1.0),
+            ('r3: API server process CPU, same differences', 'api_server_cpu_cores', 'cores',
+             lambda r: f'{r["api_server_cpu_cores"]:.2f}', lambda v: f'{v:+.3f}', 1.0)):
+        out += [title, f'len    C  {"baseline":>{W}s}' + ''.join(f'{c:>{W}s}' for c in cols) + f'   ({unit})']
+        for (length, conc), by in sorted(rows.items()):
+            b, co = by.get('baseline'), by.get('collect_only')
+            vals = ([diff(by.get('baseline_end'), b, key), diff(co, b, key)] + [diff(by.get(p), co, key) for p in rc3]
+                    + [diff(by.get('baseline_logprobs'), b, key)])
+            out.append(f'{length:<5d}{conc:>4d}  {"-" if b is None else base_fmt(b):>{W}s}' +
+                       ''.join(f'{"-" if v is None else fmt(v * scale):>{W}s}' for v in vals))
+        if key == 'server_tpot_ms':
+            for name, prof in (('collect', 'collect_only'), ('logprobs_path', 'baseline_logprobs')):
+                out.append(f'  {name} in % of the baseline TPOT: ' + ', '.join(
+                    f'len {length} C {conc}: {100 * (by[prof][key] / by["baseline"][key] - 1):+.2f}%'
+                    for (length, conc), by in sorted(rows.items()) if 'baseline' in by and prof in by))
+    return out
 
 
 def r2_tables(rows, rc3):

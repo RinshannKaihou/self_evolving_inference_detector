@@ -3,9 +3,12 @@
 protocol (profiles, waves, /metrics deltas, coverage of the v35 events) can be exercised without a GPU. Its timings mean
 nothing. It drives the v35 hooks exactly as the patched OutputProcessor does (register / feed per step / finish), from
 the same environment variables, and applies vLLM's repetition check (upstream transcription) when a request asks for it.
-A request with "logprobs": k gets synthetic logprobs, handed to the feed hook in vLLM 0.27's shape (a LogprobsLists of
-[1, k + 1]: the generated token, then the top-k) and returned in the completions format; "logit_bias" with a bias >= 50
-makes that token the output at every step (the rc3 smoke uses it to produce a lone UTF-8 continuation byte).
+Every token gets a synthetic top-1 logprob and generated-token logprob. As the patched engine does (r3), they reach the
+feed hook as EngineCoreOutput.v35_rare ([top1, chosen]) for every request when V35_RARE is collect or shadow (read by
+v35_detector.serving.collect, as the patched sampler reads it), whatever the request asks; a request with "logprobs": k
+also gets the same values back in the completions format (top_logprobs keyed "token_id:N" with
+"return_tokens_as_token_ids"), as vLLM returns its raw logprobs. "logit_bias" with a bias >= 50 makes that token the output
+at every step (the rc3 smoke uses it to produce a lone UTF-8 continuation byte).
 
   python bench/fake_vllm_server.py --port 18790 [--step-ms 2]
 """
@@ -15,23 +18,16 @@ import json
 import os
 import sys
 import time
-from typing import NamedTuple
 
 import numpy as np
 from aiohttp import web
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 from v35_detector.serving import hooks  # noqa: E402  (reads V35_* at import, as in the patched vLLM)
+from v35_detector.serving.collect import SAMPLER  # noqa: E402  (the engine side: collects when V35_RARE is on)
 
 LABELS = '{engine="0",model_name="bench"}'
 LN10 = 2.302585092994046
-
-
-class LogprobsLists(NamedTuple):                         # vllm/v1/outputs.py (0.27.0)
-    logprob_token_ids: np.ndarray
-    logprobs: np.ndarray
-    sampled_token_ranks: np.ndarray
-    cu_num_generated_tokens: list = None
 STATS = {k: 0.0 for k in ('tpot_sum', 'tpot_count', 'itl_sum', 'itl_count', 'ttft_sum', 'ttft_count')}
 
 
@@ -62,6 +58,7 @@ async def completions(request):
     body = await request.json()
     n_max, prompt, rep = int(body['max_tokens']), body['prompt'], body.get('repetition_detection')
     k_lp = body.get('logprobs')
+    as_ids = bool(body.get('return_tokens_as_token_ids'))
     forced = [int(t) for t, b in (body.get('logit_bias') or {}).items() if b >= 50]
     rng = np.random.default_rng(int(body.get('seed', 0)))
     rid = f'cmpl-{id(request)}-{time.monotonic_ns()}'
@@ -78,16 +75,21 @@ async def completions(request):
             tok = forced[0]
         ids.append(tok)
         times.append(time.perf_counter())
-        lps, out_lp = None, None
-        if k_lp is not None:                             # top-1 logprob; the generated token is the top-1 85% of the time
-            top1 = -float(rng.exponential(0.3)) * LN10
-            chosen = top1 if rng.random() < 0.85 else top1 - float(rng.exponential(1.0)) * LN10
-            row_ids = np.array([[tok, tok if chosen == top1 else tok + 1] + [0] * (k_lp - 1)], np.int32)[:, :k_lp + 1]
-            row_lp = np.array([[chosen, top1] + [top1 - 1.0 - j for j in range(k_lp - 1)]], np.float32)[:, :k_lp + 1]
-            lps = LogprobsLists(row_ids, row_lp, np.zeros(1, np.int32))
-            out_lp = {'tokens': ['.'], 'token_logprobs': [chosen], 'top_logprobs': [{'.': top1}] if k_lp else [None],
+        # the raw distribution's top-1 logprob and the generated token's (float32, as the sampler computes them); the
+        # generated token is the top-1 85% of the time
+        top1 = float(np.float32(-float(rng.exponential(0.3)) * LN10))
+        chosen = top1 if rng.random() < 0.85 else float(np.float32(top1 - float(rng.exponential(1.0)) * LN10))
+        if forced:                                       # raw logprobs ignore the logit bias: the forced token is unlikely
+            chosen = float(np.float32(top1 - 5 * LN10))
+        out_lp = None
+        if k_lp is not None:                             # what vLLM returns for logprobs=k (raw_logprobs)
+            key = (lambda t: f'token_id:{t}') if as_ids else (lambda t: '.' if t == tok else ',')
+            top = {key(tok if chosen == top1 else tok + 1): top1}
+            if k_lp and chosen != top1:
+                top[key(tok)] = chosen
+            out_lp = {'tokens': [key(tok)], 'token_logprobs': [chosen], 'top_logprobs': [top] if k_lp else [None],
                       'text_offset': [k]}
-        stop = hooks.feed(rid, [tok], lps)
+        stop = hooks.feed(rid, [tok], [top1, chosen] if SAMPLER is not None else None)
         done = k + 1 == n_max
         if stop is not None:
             finish, stop_reason, done = 'stop', stop, True

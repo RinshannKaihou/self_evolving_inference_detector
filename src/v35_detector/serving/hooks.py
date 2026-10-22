@@ -1,24 +1,28 @@
-"""Hooks called by the patched vLLM OutputProcessor (integrations/vllm_0_27/patch_output_processor.py); one service per
-process that serves requests (each API server process).
+"""Hooks called by the patched vLLM OutputProcessor (integrations/vllm_0_27/patch_vllm.py); one service per process that
+serves requests (each API server process).
 
     register(request_id)                      a request enters the output processor
-    feed(request_id, token_ids, logprobs=None) -> str|None
-                                              the new tokens of one engine step and their sample logprobs (vLLM's
-                                              EngineCoreOutput.new_logprobs: a LogprobsLists whose .logprobs is [tokens,
-                                              1 + k], the generated token in column 0 and the top-k after it; None when the
-                                              request did not ask for logprobs); in intercept mode, once m4 fires, returns the
-                                              stop_reason the patch finishes the request with (as a stop string:
-                                              finish_reason 'stop', and the request is aborted in the engine core)
+    feed(request_id, token_ids, rare=None) -> str|None
+                                              the new tokens of one engine step and rc3's values for them (r3: computed in
+                                              vLLM's sampler from the raw logits, v35_detector/serving/collect.py, and carried
+                                              in EngineCoreOutput.v35_rare: a list [top1_0, chosen_0, top1_1, chosen_1, ...]
+                                              of natural-log logprobs, two per token; None when the engine collected
+                                              nothing); in intercept mode, once m4 fires, returns the stop_reason the patch
+                                              finishes the request with (as a stop string: finish_reason 'stop', and the
+                                              request is aborted in the engine core)
     finish(request_id, finish_reason)         the request finished for any reason; the last partial block is scored for the log
     abort(request_id)                         the request was cancelled; its state is dropped
 
 Environment, read when this module is imported (a misconfiguration stops the server at start-up):
   V35_DETECTOR            off (default) | shadow (detect and log) | intercept (detect, log and stop the request): m4
-  V35_RARE                off (default) | shadow: the garbled-output monitor rc3; it detects and logs, it never stops a
-                          request. Only requests with logprobs >= 1 are checked (it reads the top-1 and the generated
-                          token's logprob); the others are skipped by rc3, m4 still checks them
-  V35_DETECTOR_TABLE      qwen3 | glm | dsv4 | /path/to/table.npz (built by v35_detector.vocab); required unless both are off;
-                          rc3 needs a shipped name (its rare and reference tables come with it)
+  V35_RARE                off (default) | collect | shadow: the garbled-output monitor rc3. The engine's sampler computes
+                          rc3's two values for every request whatever the request asks (collect.py reads the same
+                          variable); shadow runs rc3 on them, detects and logs, and never stops a request; collect only
+                          receives the values and records coverage (the cost of collection and transport alone)
+  V35_RARE_TRACE          N > 0: log the first N tokens' values of every request ('rare_trace' events; for the smoke test)
+  V35_DETECTOR_TABLE      qwen3 | glm | dsv4 | /path/to/table.npz (built by v35_detector.vocab); required when m4 or rc3
+                          detects (not for collect alone); rc3 needs a shipped name (its rare and reference tables come with
+                          it)
   V35_DETECTOR_THINK_END  auto (default; shipped tables only) | none (chat mode) | the '</think>' token id
   V35_DETECTOR_RUNNER     sync (default: inside the output-processing loop) | async (a separate detector process); both
                           detectors run in the same place
@@ -26,7 +30,7 @@ Environment, read when this module is imported (a misconfiguration stops the ser
   V35_DETECTOR_EVENTS     JSONL of alerts (m4: 'alert', rc3: 'rare_alert'), interceptions, errors, finished requests and
                           summaries (default ./v35-detector-events.jsonl)
 
-Tokens (and, for rc3, their two logprobs) are buffered per request and handed over in whole 64-token blocks, so the alerts
+Tokens (and, for rc3, their two values) are buffered per request and handed over in whole 64-token blocks, so the alerts
 equal the evaluated detectors' under any chunking. Fail-open: an error inside a detector is logged and ends that detector
 for that request; a dead or saturated async worker ends detection for the affected requests. Serving never fails
 because of the detectors. With V35_RARE=off the m4 path is the one tested on the H20 (code tag h20-r1).
@@ -50,7 +54,7 @@ from ..vocab import THINK_END
 from .worker import rare_step, worker_main
 
 MODES = ('off', 'shadow', 'intercept')
-RARE_MODES = ('off', 'shadow')                           # rc3 monitors only: there is no intercept mode
+RARE_MODES = ('off', 'collect', 'shadow')                # rc3 monitors only: there is no intercept mode
 RUNNERS = ('sync', 'async')
 STOP_PREFIX = 'v35_repetition: '
 SUMMARY_EVERY_S = 10.0
@@ -68,21 +72,22 @@ def settings(env):
         raise ValueError(f'V35_RARE={rare!r}: expected one of {RARE_MODES} (rc3 only monitors, it never stops a request)')
     if mode == 'off' and rare == 'off':
         return None
+    trace = int(env.get('V35_RARE_TRACE', '0') or 0)
     table = env.get('V35_DETECTOR_TABLE')
-    if not table:
+    if not table and (mode != 'off' or rare == 'shadow'):
         raise ValueError('V35_DETECTOR_TABLE is required (qwen3 | glm | dsv4 | path to a .npz table)')
     te = env.get('V35_DETECTOR_THINK_END', 'auto')
     think_end = te if te == 'auto' else None if te == 'none' else int(te)
     runner = env.get('V35_DETECTOR_RUNNER', 'sync')
     if runner not in RUNNERS:
         raise ValueError(f'V35_DETECTOR_RUNNER={runner!r}: expected one of {RUNNERS}')
-    s = dict(mode=mode, rare=rare, table=table, think_end=think_end, runner=runner,
+    s = dict(mode=mode, rare=rare, table=table, think_end=think_end, runner=runner, trace=trace,
              config=env.get('V35_DETECTOR_CONFIG', CONFIG_M4), rare_config=CONFIG_RC3,
              events=env.get('V35_DETECTOR_EVENTS', './v35-detector-events.jsonl'))
     if mode != 'off':
         det = RepDetector(table, s['config'], think_end)     # fails now on a bad table, think_end or config
         s['think_end'] = det.think_end
-    if rare != 'off':
+    if rare == 'shadow':
         if table not in THINK_END:
             raise ValueError(f'V35_RARE needs a shipped table in V35_DETECTOR_TABLE ({" | ".join(THINK_END)}), got {table!r}: '
                              'rc3 also needs the model\'s rare and reference tables')
@@ -96,7 +101,7 @@ def settings(env):
 class _SyncRunner:
     def __init__(self, s, on_result):
         self.det = RepDetector(s['table'], s['config'], s['think_end']) if s['mode'] != 'off' else None
-        self.rare = RareDetector(s['table'], s['rare_config'], s['think_end']) if s['rare'] != 'off' else None
+        self.rare = RareDetector(s['table'], s['rare_config'], s['think_end']) if s['rare'] == 'shadow' else None
         self.st = {}
         self.rst = {}                                    # rid -> [rc3 state, monitoring-tier alert reported]
         self.seconds = 0.0
@@ -157,7 +162,7 @@ class _AsyncRunner:
         self.inq, self.outq = ctx.Queue(maxsize=QUEUE_MAX), ctx.Queue()
         self.proc = ctx.Process(target=worker_main, args=(self.inq, self.outq, s['table'],
                                                           s['config'] if s['mode'] != 'off' else None, s['think_end'],
-                                                          s['rare_config'] if s['rare'] != 'off' else None),
+                                                          s['rare_config'] if s['rare'] == 'shadow' else None),
                                 daemon=True, name='v35-detector')
         # spawn re-runs the parent's entry script in the child (for vLLM: its CLI, i.e. torch and all of vLLM); the worker
         # needs only this package, so the entry point is hidden while the child is prepared
@@ -256,10 +261,15 @@ class Service:
         self.broken = False                              # the runner could not be built: detection is off for the process
         self.last_summary = time.monotonic()
         self.m4 = s['mode'] != 'off'
-        self.rare = s['rare'] != 'off'
-        self.rare_wait = set()                           # rc3: registered, no token yet (whether it has logprobs is unknown)
-        self.rare_pending = {}                           # rc3: rid -> (ids, top-1 logprobs, chosen logprobs) (< BLOCK each)
+        self.rare = s['rare'] != 'off'                   # rc3 values are received and their coverage recorded
+        self.rare_detect = s['rare'] == 'shadow'         # ... and rc3 runs on them (collect: it does not)
+        self.needs_runner = self.m4 or self.rare_detect
+        self.rare_wait = set()                           # rc3: registered, no token yet (whether values come is unknown)
+        self.rare_pending = {}                           # rc3: rid -> (ids, top-1 logprobs, chosen logprobs) (< BLOCK each;
+                                                         # collect: empty, it marks the request as covered so far)
         self.rare_status = {}                            # rc3 coverage for the finish event (see rare_finish)
+        self.trace = s.get('trace', 0)
+        self.rare_trace = {}                             # V35_RARE_TRACE: rid -> (ids, top1, chosen), the first N tokens
         atexit.register(self.close)
 
     # ---------------------------------------------------------------- bookkeeping
@@ -350,7 +360,7 @@ class Service:
         with self.lock:
             self.rare_status[rid] = status
         try:
-            if self.runner is not None:
+            if self.runner is not None and self.rare_detect:
                 self.runner.rare_drop(rid)
         except Exception:
             pass
@@ -360,41 +370,56 @@ class Service:
         self.event('error', request_id=rid, where=what, error=f'{type(error).__name__}: {error}')
         self.rare_stop(rid, 'error')
 
-    def rare_feed(self, rid, token_ids, logprobs):
-        if not len(token_ids):
+    def rare_feed(self, rid, token_ids, values):
+        n = len(token_ids)
+        if not n:
             return
+        ok = type(values) is list and len(values) == 2 * n      # what the patched engine sends: two floats per token
+        if ok:
+            self.n['rare_values'] += n
+        if ok and self.trace:
+            tr = self.rare_trace.get(rid)
+            if tr is not None and len(tr[0]) < self.trace:
+                tr[0].extend(token_ids)
+                tr[1].extend(values[0::2])
+                tr[2].extend(values[1::2])
         buf = self.rare_pending.get(rid)
         if buf is None:
-            if rid not in self.rare_wait:                # not checked by rc3 (no logprobs, ended, error, not registered)
+            if rid not in self.rare_wait:                # not checked by rc3 (no values, ended, error, not registered)
                 return
             self.rare_wait.discard(rid)                  # the request's first tokens decide whether rc3 can check it
-            if logprobs is None:
-                self.rare_status[rid] = 'no_logprobs'
-                self.n['rare_no_logprobs'] += 1
+            if values is None:
+                self.rare_status[rid] = 'no_values'
+                self.n['rare_no_values'] += 1
                 return
-            try:
-                self.runner.rare_start(rid)
-            except Exception as e:
-                self.rare_fail(rid, e, 'rare_start')
-                return
+            if self.rare_detect:
+                try:
+                    self.runner.rare_start(rid)
+                except Exception as e:
+                    self.rare_fail(rid, e, 'rare_start')
+                    return
             buf = self.rare_pending[rid] = ([], [], [])
             self.rare_status[rid] = 'checked'
             self.n['rare_requests'] += 1
+        if not ok:
+            self.n['rare_lost'] += 1                     # values stopped coming, or not two per token
+            self.rare_stop(rid, 'lost')
+            return
+        if not self.rare_detect:                         # collect: the values arrived, that is all
+            return
         try:
-            lp = None if logprobs is None else logprobs.logprobs
-            if lp is None or lp.ndim != 2 or lp.shape[0] != len(token_ids) or lp.shape[1] < 2:
-                self.n['rare_lost'] += 1                 # logprobs stopped coming, or without a top-1 (logprobs=0)
-                self.rare_stop(rid, 'lost')
-                return
             ids, top1, chosen = buf
             ids.extend(token_ids)
-            for row in lp.tolist():                      # vLLM's sampler: column 0 the generated token, then the top-k
-                chosen.append(row[0])
-                top1.append(row[1])
+            if n == 1:
+                top1.append(values[0])
+                chosen.append(values[1])
+            else:
+                top1.extend(values[0::2])
+                chosen.extend(values[1::2])
             if len(ids) >= BLOCK:
                 k = len(ids) - len(ids) % BLOCK
-                hits, done = self.runner.rare_feed(rid, np.asarray(ids[:k], np.int64), np.asarray(top1[:k]),
-                                                   np.asarray(chosen[:k]))
+                hits, done = self.runner.rare_feed(rid, np.asarray(ids[:k], np.int64), np.asarray(top1[:k], np.float64),
+                                                   np.asarray(chosen[:k], np.float64))
                 self.n['rare_tokens'] += k
                 del ids[:k], top1[:k], chosen[:k]
                 for h in hits:
@@ -405,12 +430,12 @@ class Service:
             self.rare_fail(rid, e, 'rare_feed')
 
     def rare_finish(self, rid):
-        """rc3 coverage of the request: checked (every token, or up to its strict alert) | no_logprobs (the request did not
-        ask for logprobs) | lost (logprobs stopped coming, or came without a top-1) | error | none (no token, or detection
-        unavailable)"""
+        """rc3 coverage of the request: checked (values for every token; rc3 ran on all of them, or up to its strict alert)
+        | no_values (the engine sent no values: collection off in the engine, or a path that does not collect) | lost
+        (values stopped coming) | error | none (no token, or detection unavailable)"""
         self.rare_wait.discard(rid)
         buf = self.rare_pending.pop(rid, None)
-        if buf is not None:
+        if buf is not None and self.rare_detect:
             try:
                 ids, top1, chosen = buf
                 hits = self.runner.rare_finish(rid, np.asarray(ids, np.int64), np.asarray(top1, np.float64),
@@ -420,6 +445,9 @@ class Service:
                     self.rare_log(rid, *h, after_end=True)
             except Exception as e:
                 self.rare_fail(rid, e, 'rare_finish')
+        tr = self.rare_trace.pop(rid, None)
+        if tr is not None and tr[0]:
+            self.event('rare_trace', request_id=rid, token_ids=tr[0], top1=tr[1], chosen=tr[2])
         with self.lock:
             return self.rare_status.pop(rid, 'none')
 
@@ -430,28 +458,31 @@ class Service:
         if self.broken:
             return
         try:
-            if self.runner is None:
-                try:
-                    self.runner = (_AsyncRunner if self.s['runner'] == 'async' else _SyncRunner)(self.s, self.on_result)
-                except Exception:
-                    self.broken = True
-                    raise
-            if not self.runner.alive():
-                self.n['worker_down'] += 1
-                return
+            if self.needs_runner:                        # not for V35_RARE=collect alone
+                if self.runner is None:
+                    try:
+                        self.runner = (_AsyncRunner if self.s['runner'] == 'async' else _SyncRunner)(self.s, self.on_result)
+                    except Exception:
+                        self.broken = True
+                        raise
+                if not self.runner.alive():
+                    self.n['worker_down'] += 1
+                    return
             if self.m4:
                 self.runner.start(rid)
                 self.pending[rid] = []
             if self.rare:
                 self.rare_wait.add(rid)
+                if self.trace:
+                    self.rare_trace[rid] = ([], [], [])
         except Exception as e:
             self.fail(rid, e, 'register')
 
-    def feed(self, rid, token_ids, logprobs=None):
+    def feed(self, rid, token_ids, rare=None):
         if rid in self.tokens:
             self.tokens[rid] += len(token_ids)
         if self.rare:
-            self.rare_feed(rid, token_ids, logprobs)
+            self.rare_feed(rid, token_ids, rare)
         buf = self.pending.get(rid)
         if buf is None:
             return None
@@ -501,7 +532,8 @@ class Service:
                 pass
         if self.rare:
             self.rare_wait.discard(rid)
-            if self.rare_pending.pop(rid, None) is not None:
+            self.rare_trace.pop(rid, None)
+            if self.rare_pending.pop(rid, None) is not None and self.rare_detect:
                 try:
                     self.runner.rare_drop(rid)
                 except Exception:
@@ -535,8 +567,8 @@ def register(request_id):
         _SERVICE.register(request_id)
 
 
-def feed(request_id, token_ids, logprobs=None):
-    return _SERVICE.feed(request_id, token_ids, logprobs) if _SERVICE is not None else None
+def feed(request_id, token_ids, rare=None):
+    return _SERVICE.feed(request_id, token_ids, rare) if _SERVICE is not None else None
 
 
 def finish(request_id, finish_reason):

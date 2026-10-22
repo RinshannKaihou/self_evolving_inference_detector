@@ -11,8 +11,10 @@ rc3 (garbled-output monitor) gets the same token streams with synthetic logprobs
 word sequences put far more tokens through the learned score's gate than real outputs do (rare_gb_gate_share here, about 1%
 on real outputs), so its per-token figure overstates the real cost (research repo, real dev records: 0.76 us/token on an
 Apple M3 Pro). 'hooks' times the whole sync path of serving/hooks.py per token (buffering, 64-token blocks, events) for m4,
-rc3 and both, driven by 1-token engine steps with vLLM-shaped logprobs, as the patched OutputProcessor calls it, on loop-free
-streams with greedy logprobs so that both detectors run to the end of every request (hooks_alerts counts the exceptions).
+rc3 and both, driven by 1-token engine steps carrying rc3's two values as the patched engine sends them (r3:
+EngineCoreOutput.v35_rare, [top1, chosen]), as the patched OutputProcessor calls it, on loop-free streams with greedy values
+so that both detectors run to the end of every request (hooks_alerts counts the exceptions). rc3_collect is V35_RARE=collect:
+the hook only receives the values (the frontend share of the collect_only profile).
 
   python bench/cpu_bench.py [--table qwen3] [--rounds 3] [--vllm] [--out runs/cpu_bench.json]
 """
@@ -24,8 +26,6 @@ import sys
 import tempfile
 import time
 import tracemalloc
-from typing import NamedTuple
-
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -43,13 +43,6 @@ LN10 = np.log(10.0)
 NOTE_RC3 = ('rc3 inputs are synthetic: random word sequences with synthetic logprobs put far more tokens through the learned '
             "score's gate (rare_gb_gate_share) than real outputs (about 1%), so rare_us_per_token overstates the real cost: "
             'a conservative upper figure (research repo, real dev records: 0.76 us/token on an Apple M3 Pro)')
-
-
-class LogprobsLists(NamedTuple):                         # vllm/v1/outputs.py (0.27.0), as the feed hook receives it
-    logprob_token_ids: np.ndarray
-    logprobs: np.ndarray
-    sampled_token_ranks: np.ndarray
-    cu_num_generated_tokens: list = None
 
 
 def synthetic_logprobs(n, rng):
@@ -113,22 +106,22 @@ def bench_rare(table, streams, rounds):
 
 
 def bench_hooks(table, rounds, seeds=4):
-    """us per token of the whole sync hook path (register, 1-token feeds with logprobs, finish) for m4, rc3, both; on
+    """us per token of the whole sync hook path (register, 1-token feeds with rc3's values, finish) for m4, rc3, both; on
     streams without loops, so that the detectors run to the end of every request (alerts are counted in the output)"""
     data = []
     for s in range(1, seeds + 1):                        # English-like: Latin words, punctuation, digits, a think-end
         tok, lp1, _ = rare_synth(table, 6000, s, han_share=0.0)
-        lp1 = lp1 / 6                                    # greedy and confident (the research Qwen3 data is greedy): rc3 still
-        rows = [LogprobsLists(np.array([[t, t]], np.int32), np.array([[a, a]], np.float32), np.zeros(1, np.int32))
-                for t, a in zip(tok.tolist(), lp1)]    # scores every gated token, it just rarely fires
+        lp1 = (lp1 / 6).astype(np.float32).tolist()      # greedy and confident (the research Qwen3 data is greedy): rc3 still
+        rows = [[a, a] for a in lp1]                     # scores every gated token, it just rarely fires
         data.append((tok.tolist(), rows))
     n = sum(len(t) for t, _ in data)
     out, alerts = {}, {}
     with tempfile.TemporaryDirectory() as tmp:
-        for name, m4, rare, with_lp in (('m4', 'shadow', 'off', False), ('m4_logprobs_ignored', 'shadow', 'off', True),
+        for name, m4, rare, with_lp in (('m4', 'shadow', 'off', False), ('m4_values_ignored', 'shadow', 'off', True),
+                                        ('rc3_collect', 'off', 'collect', True),
                                         ('rc3', 'off', 'shadow', True), ('rc3_buffering_only', 'off', 'shadow', True),
                                         ('m4_rc3', 'shadow', 'shadow', True),
-                                        ('m4_rc3_no_logprobs', 'shadow', 'shadow', False)):
+                                        ('m4_rc3_no_values', 'shadow', 'shadow', False)):
             svc = hooks.Service(hooks.settings({'V35_DETECTOR': m4, 'V35_RARE': rare, 'V35_DETECTOR_TABLE': table,
                                                 'V35_DETECTOR_EVENTS': os.path.join(tmp, name + '.jsonl')}))
             if name == 'rc3_buffering_only':             # the hook's own work: the detector is replaced by a no-op

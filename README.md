@@ -2,18 +2,20 @@
 
 在生成过程中检测模型"陷入循环"（taxonomy v3.5 的 `repetition` core），每 64 个 token 判一次，命中后可以像 stop string 一样立刻结束请求。
 0.2.0 起另含乱码检测器 rc3（taxonomy v3.5.1 的 `rare_chars`），只做监控：有离线接口，也已接入同一组 vLLM 钩子（`V35_RARE=shadow`），
-报警只记日志，从不结束请求（见下文）。
+报警只记日志，从不结束请求（见下文）。0.3.0（交接包 r3）起 rc3 的输入在 vLLM 的采样器里采集，请求不需要带 logprobs。
 
 - m4 **只用生成的 token id**，不需要 logprob、不需要 top-k。
 - 每 token 约 3.4–3.6 μs（Mac 单线程）、6.7–14 μs（H20 服务器，含线上实测），每请求状态约 166 KB，有上界，不随输出长度增长。
 - H20 单卡实测：开启检测后 TPOT 变化在 ±22 μs/token（≤ 0.14%）以内，小于测量分辨率；拦截冒烟通过（`docs/INTEGRATION.md` §7）。
 - 召回与误报（研究仓库 `detector_v35` 的评测，每语料 FPR 上限 0.1%）：Qwen3 holdout core 召回 0.444、FPR 0.062%；vLLM 原生检查调参版 0.317。
 - 本仓库的判定逻辑、配置与词表是研究仓库被评测版本的逐字节拷贝（`src/v35_detector/MANIFEST.json`），并在全部 19,321 条 dev 记录上逐条复现了它的报警（`tools/verify_against_research.py`）。
-- **乱码监控 rc3**（`RareDetector`、`CONFIG_RC3`）：输入是 token id、top-1 logprob 与生成 token 的 logprob（vLLM `logprobs=1`）。
+- **乱码监控 rc3**（`RareDetector`、`CONFIG_RC3`）：输入是 token id、top-1 logprob 与生成 token 的 logprob（原始分布，即 vLLM `logprobs=1` 返回的那两个数）。
   - 严格档（误报率上限 0.1%）Qwen3 holdout core 召回 0.433，前一版 rc2 为 0.294；误报率 0.213%，**超过 0.1% 的上限**，所以只做监控、不拦截。
   - 离线每 token 约 0.76 μs（Mac），每请求状态约 1.3 KB，每进程常驻约 64 MB（参照表等）；与研究仓库逐条复现了 dev 上 663 次严格档、1,161 次监控档报警。
-  - 在线：`V35_RARE=shadow`，只检查带 `logprobs=1`（或更多）的请求，其余请求 rc3 跳过、m4 照常。
-    打开 logprobs 本身与 rc3 在 H20 上的开销还没有测，测试方案与交接包 r2 见 `docs/INTEGRATION.md` §10。
+  - 在线：`V35_RARE=shadow`。r3 起两个 logprob 由打过补丁的 vLLM 采样器算出（采样后两个 Triton 核规约原始 logits，不写整词表 logprob、
+    不排序），经 `EngineCoreOutput.v35_rare` 送到前端钩子，每个请求都检查，客户端可见的 logprobs 不受影响（`docs/INTEGRATION.md` §10.2）。
+  - H20 实测（交接包 r2，当时请求带 `logprobs=1` 走 vLLM 自带 logprobs 路径取数）：rc3 本身的 TPOT 增量测不出（每 token 3.7–4.3 μs）；
+    那条取数路径使 TPOT 增加 1.3–3.1%（`docs/INTEGRATION.md` §10.3）。r3 的采样器采集成本待 H20 实测（§10.4）。
 
 ## 安装
 
@@ -50,9 +52,10 @@ res = res or rare.finish(st)
 mon = rare.monitor(st)                                      # 监控档（误报上限 0.5%）的首次报警
 ```
 
-接入 vLLM 0.27：`integrations/vllm_0_27/patch_output_processor.py` 在 OutputProcessor 里加 4 个钩子（共 17 行），
-feed 钩子同时传入该步的 `new_logprobs`。m4 由 `V35_DETECTOR=off|shadow|intercept` 控制，rc3 由 `V35_RARE=off|shadow` 控制
-（只监控，没有拦截模式），见 `docs/INTEGRATION.md` §4、§10。
+接入 vLLM 0.27：`integrations/vllm_0_27/patch_vllm.py` 改 5 个文件、共 35 行（每行带 `# v35-detector hook`）：OutputProcessor 的 4 个钩子
+（17 行），以及 rc3 的采集与传输（采样器、GPU model runner、调度器、`EngineCoreOutput` 的一个新字段）。m4 由
+`V35_DETECTOR=off|shadow|intercept` 控制，rc3 由 `V35_RARE=off|collect|shadow` 控制（只监控，没有拦截模式；`off` 时采样器不做额外工作），
+见 `docs/INTEGRATION.md` §4、§10。
 
 ## 文档
 
@@ -66,12 +69,14 @@ src/v35_detector/       core.py（判据定义）  stream.py（流式检测器�
                         trees.py  vocab.py（词表）  configs/m4.json  tables/*.npz  MANIFEST.json
                         rare.py（乱码检测器 rc3）  rare_gb.py（学习打分）  rare_ref.py（参照表）  rare_vocab.py（乱码词表）
                         configs/rc3.json  tables/*_rare.npz  tables/{qwen3,glm}_rcref.npz  tables/rc3_gb.npz
-                        serving/hooks.py（vLLM 钩子）  serving/worker.py（异步检测进程）
-integrations/vllm_0_27/ patch_output_processor.py（锚点补丁：--check / --apply / --revert）
+                        serving/hooks.py（vLLM 钩子）  serving/worker.py（异步检测进程）  serving/collect.py（采样器里的 rc3 采集）
+integrations/vllm_0_27/ patch_vllm.py（5 个文件的锚点补丁：--check / --apply / --revert）
 bench/                  run_h20.sh（H20 验证与性能测试一键脚本）  cpu_bench.py（每 token 开销）
-                        online_tpot.py（在线 TPOT / CPU / 内存）  smoke_intercept.py（拦截冒烟）
-                        fake_vllm_server.py（无 GPU 演练）  server_tpot_metrics.py  summarize_tpot.py（结果摘要）
-tests/                  合成数据测试：流式 = 参照、vLLM 规则等价、状态有界、钩子（含 rc3）、补丁、MANIFEST、rc3（test_rare.py）
+                        online_tpot.py（在线 TPOT / CPU / 内存）  smoke_intercept.py（拦截与 rc3 冒烟）
+                        collect_gpu_check.py（采样器 Triton 核的 GPU 核对）  fake_vllm_server.py（无 GPU 演练）
+                        server_tpot_metrics.py  summarize_tpot.py（结果摘要）
+tests/                  合成数据测试：流式 = 参照、vLLM 规则等价、状态有界、钩子（含 rc3）、补丁与采集链路（test_vllm_patch.py）、
+                        采集公式（test_collect.py）、MANIFEST、rc3（test_rare.py）
 tools/                  verify_against_research.py（与研究仓库逐条对比）  make_manifest.py
 ```
 

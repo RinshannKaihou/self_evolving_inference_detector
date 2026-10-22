@@ -1,36 +1,39 @@
 #!/usr/bin/env python3
 """Online TPOT, CPU and memory of the v35 detectors inside vLLM: m4 (repetition) next to vLLM's own repetition check, and the
-garbled-output monitor rc3 next to the cost of asking vLLM for logprobs at all.
+garbled-output monitor rc3 with its inputs collected in vLLM's sampler (r3) next to vLLM's own logprobs path (r2's way).
 
 Slimmed from the previous online tests (v32_online/online_tpot_run.py): one vLLM server per profile, started and stopped
 by this script; every request generates exactly the requested number of tokens (ignore_eos), so all profiles do the same
 work; the detectors run in shadow mode (they detect and log, never stop a request).
 
-Profiles (default: the r2 set, marked *; r1 ran baseline, vllm_*, v35_*, baseline_end)
-  baseline, baseline_end *  detectors off, no logprobs; run first and last to measure the drift of the session
-  baseline_logprobs *       every request asks for logprobs=1, detectors off: the cost of logprobs itself (GPU sampler,
-                            engine-to-frontend transfer, the frontend's logprob objects and their JSON in the response)
-  rc3_shadow_sync *         logprobs=1, V35_RARE=shadow (m4 off), sync runner (inside the output-processing loop)
-  rc3_shadow_async *        logprobs=1, V35_RARE=shadow (m4 off), async runner (a separate detector process)
-  m4_rc3_sync *             logprobs=1, V35_DETECTOR=shadow and V35_RARE=shadow, sync runner
-  m4_rc3_async *            logprobs=1, V35_DETECTOR=shadow and V35_RARE=shadow, async runner
+Profiles (default: the r3 set, marked *; r1 ran baseline, vllm_*, v35_*, baseline_end). No profile asks for logprobs
+except baseline_logprobs: with r3 rc3 gets its values from the sampler whatever the request asks.
+  baseline, baseline_end *  detectors off; run first and last to measure the drift of the session
+  collect_only *            V35_RARE=collect: the sampler kernels and the transport to the frontend, rc3 itself off
+  rc3_sync *                V35_RARE=shadow (m4 off), sync runner (inside the output-processing loop)
+  rc3_async *               V35_RARE=shadow (m4 off), async runner (a separate detector process)
+  m4_rc3_sync *             V35_DETECTOR=shadow and V35_RARE=shadow, sync runner
+  m4_rc3_async *            V35_DETECTOR=shadow and V35_RARE=shadow, async runner
+  baseline_logprobs *       every request asks for logprobs=1, detectors off: vLLM's own logprobs path (r2's way of
+                            getting rc3's inputs; full-vocabulary log-softmax, top-k, ranks, transfer, Logprob objects, JSON)
   vllm_default              vLLM's check per request, repetition_detection [50,500]x3 (vLLM's default sizes)
   vllm_tuned                vLLM's check per request, [32,2000]x3 (tuned on dev under the same 0.1% cap)
-  v35_sync                  V35_DETECTOR=shadow, sync runner (no logprobs)
-  v35_async                 V35_DETECTOR=shadow, async runner (no logprobs)
+  v35_sync                  V35_DETECTOR=shadow, sync runner
+  v35_async                 V35_DETECTOR=shadow, async runner
 vLLM's check stops a request when it finds a loop; such requests are counted (early_stops) and their tokens kept.
-The rc3 increment is a logprobs profile against baseline_logprobs; the cost of logprobs is baseline_logprobs against
-baseline (bench/summarize_tpot.py prints both).
+Collection cost = collect_only - baseline; rc3 increment = rc3_* / m4_rc3_* - collect_only; r2's way = baseline_logprobs -
+baseline (bench/summarize_tpot.py prints all three next to the drift).
 
 Per (profile, output length, concurrency), over timed waves after warm-up waves:
   server TPOT (vllm:request_time_per_output_token_seconds) and ITL (vllm:inter_token_latency_seconds), /metrics deltas;
   client TPOT from SSE chunk arrivals; throughput; CPU seconds of every server process during the wave;
   memory (RSS / PSS / USS) of every server process when ready and after each output length;
-  v35 coverage from its events file: one 'finish' per request with all its tokens, no 'error' event, and with rc3 on,
-  every request checked by rc3 (finish 'rare': 'checked'); logprob profiles: a logprob for every streamed token.
+  v35 coverage from its events file: one 'finish' per request with all its tokens, no 'error' event, and with rc3 on
+  (collect or shadow), every request covered by sampler values (finish 'rare': 'checked'); baseline_logprobs: a logprob for
+  every streamed token; every other profile: no logprob returned to the client.
 
   python bench/online_tpot.py --output runs/tpot_qwen3_h20 --model /workspace/models/Qwen3-30B-A3B --table qwen3 --gpu 5
-Needs: the v35 patch applied to this environment's vLLM (integrations/vllm_0_27), `pip install -e <repo>`, aiohttp, psutil,
+Needs: the v35 patch applied to this environment's vLLM (integrations/vllm_0_27/patch_vllm.py), `pip install -e <repo>`, aiohttp, psutil,
 transformers. --server-cmd replaces `vllm serve` (bench/fake_vllm_server.py runs the whole protocol without a GPU).
 """
 import argparse
@@ -60,18 +63,19 @@ PREEMPTIONS = 'vllm:num_preemptions_total'
 SAMPLING = dict(temperature=.6, top_k=20, top_p=.95, min_p=0., repetition_penalty=1., frequency_penalty=0., presence_penalty=0.)
 PROFILES = {                                             # name: (server environment, vLLM repetition check, logprobs)
     'baseline': ({'V35_DETECTOR': 'off'}, None, None),
+    'collect_only': ({'V35_DETECTOR': 'off', 'V35_RARE': 'collect'}, None, None),
+    'rc3_sync': ({'V35_DETECTOR': 'off', 'V35_RARE': 'shadow', 'V35_DETECTOR_RUNNER': 'sync'}, None, None),
+    'rc3_async': ({'V35_DETECTOR': 'off', 'V35_RARE': 'shadow', 'V35_DETECTOR_RUNNER': 'async'}, None, None),
+    'm4_rc3_sync': ({'V35_DETECTOR': 'shadow', 'V35_RARE': 'shadow', 'V35_DETECTOR_RUNNER': 'sync'}, None, None),
+    'm4_rc3_async': ({'V35_DETECTOR': 'shadow', 'V35_RARE': 'shadow', 'V35_DETECTOR_RUNNER': 'async'}, None, None),
     'baseline_logprobs': ({'V35_DETECTOR': 'off'}, None, 1),
-    'rc3_shadow_sync': ({'V35_DETECTOR': 'off', 'V35_RARE': 'shadow', 'V35_DETECTOR_RUNNER': 'sync'}, None, 1),
-    'rc3_shadow_async': ({'V35_DETECTOR': 'off', 'V35_RARE': 'shadow', 'V35_DETECTOR_RUNNER': 'async'}, None, 1),
-    'm4_rc3_sync': ({'V35_DETECTOR': 'shadow', 'V35_RARE': 'shadow', 'V35_DETECTOR_RUNNER': 'sync'}, None, 1),
-    'm4_rc3_async': ({'V35_DETECTOR': 'shadow', 'V35_RARE': 'shadow', 'V35_DETECTOR_RUNNER': 'async'}, None, 1),
     'baseline_end': ({'V35_DETECTOR': 'off'}, None, None),
     'vllm_default': ({'V35_DETECTOR': 'off'}, {'min_pattern_size': 50, 'max_pattern_size': 500, 'min_count': 3}, None),
     'vllm_tuned': ({'V35_DETECTOR': 'off'}, {'min_pattern_size': 32, 'max_pattern_size': 2000, 'min_count': 3}, None),
     'v35_sync': ({'V35_DETECTOR': 'shadow', 'V35_DETECTOR_RUNNER': 'sync'}, None, None),
     'v35_async': ({'V35_DETECTOR': 'shadow', 'V35_DETECTOR_RUNNER': 'async'}, None, None),
 }
-R2_PROFILES = ['baseline', 'baseline_logprobs', 'rc3_shadow_sync', 'rc3_shadow_async', 'm4_rc3_sync', 'm4_rc3_async',
+R3_PROFILES = ['baseline', 'collect_only', 'rc3_sync', 'rc3_async', 'm4_rc3_sync', 'm4_rc3_async', 'baseline_logprobs',
                'baseline_end']
 NOTES = ('A database keeps a write-ahead log so committed changes can be recovered after a crash. Replication improves '
          'availability, but network latency and consistency requirements affect throughput. A cache reduces repeated reads. '
@@ -132,6 +136,8 @@ async def request(session, url, prompt, length, index, rep, logprobs=None):
         raise RuntimeError(f'request {index} produced {n} tokens, expected {length} (ignore_eos)')
     if logprobs is not None and lp_positions != n:
         raise RuntimeError(f'request {index}: logprobs for {lp_positions} of {n} tokens (logprobs={logprobs} requested)')
+    if logprobs is None and lp_positions:
+        raise RuntimeError(f'request {index}: {lp_positions} logprobs returned without being asked for')
     first, last = arrivals[0][0], arrivals[-1][0]
     return dict(index=index, output_tokens=n, early_stop=n != length, finish_reason=finish, stop_reason=stop_reason,
                 ttft_seconds=first, client_tpot_seconds=(last - first) / (n - 1) if n > 1 else None,
@@ -274,7 +280,7 @@ def summarize(report):
                                                                           for it in items) / wall)
         rows.append(row)
     for row in rows:
-        for base in ('baseline', 'baseline_end', 'baseline_logprobs'):
+        for base in ('baseline', 'baseline_end', 'baseline_logprobs', 'collect_only'):
             b = next((r for r in rows if r['profile'] == base and r['output_length'] == row['output_length']
                       and r['concurrency'] == row['concurrency']), None)
             if b:
@@ -296,7 +302,7 @@ def main():
     ap.add_argument('--model', required=True)
     ap.add_argument('--table', default='qwen3', help='V35_DETECTOR_TABLE for the v35 profiles')
     ap.add_argument('--think-end', default='auto', help='V35_DETECTOR_THINK_END')
-    ap.add_argument('--profiles', nargs='+', default=R2_PROFILES, choices=list(PROFILES))
+    ap.add_argument('--profiles', nargs='+', default=R3_PROFILES, choices=list(PROFILES))
     ap.add_argument('--concurrencies', type=int, nargs='+', default=[1, 8, 32, 64])
     ap.add_argument('--output-lengths', type=int, nargs='+', default=[1024])
     ap.add_argument('--input-length', type=int, default=1024)

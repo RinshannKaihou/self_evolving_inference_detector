@@ -19,6 +19,7 @@ Environment, read when this module is imported (a misconfiguration stops the ser
                           rc3's two values for every request whatever the request asks (collect.py reads the same
                           variable); shadow runs rc3 on them, detects and logs, and never stops a request; collect only
                           receives the values and records coverage (the cost of collection and transport alone)
+  V35_RARE_CONFIG         rc3 (default) | rc4: which garbled-output configuration shadow runs (same inputs, same sampler collection)
   V35_RARE_TRACE          N > 0: log the first N tokens' values of every request ('rare_trace' events; for the smoke test)
   V35_DETECTOR_TABLE      qwen3 | glm | dsv4 | /path/to/table.npz (built by v35_detector.vocab); required when m4 or rc3
                           detects (not for collect alone); rc3 needs a shipped name (its rare and reference tables come with
@@ -46,7 +47,7 @@ from collections import Counter
 
 import numpy as np
 
-from .. import CONFIG_M4, CONFIG_RC3
+from .. import CONFIG_M4, CONFIG_RC3, CONFIG_RC4
 from ..core import BLOCK
 from ..rare import RareDetector
 from ..stream import RepDetector
@@ -55,6 +56,7 @@ from .worker import rare_step, worker_main
 
 MODES = ('off', 'shadow', 'intercept')
 RARE_MODES = ('off', 'collect', 'shadow')                # rc3 monitors only: there is no intercept mode
+RARE_CONFIGS = {'rc3': CONFIG_RC3, 'rc4': CONFIG_RC4}     # V35_RARE_CONFIG
 RUNNERS = ('sync', 'async')
 STOP_PREFIX = 'v35_repetition: '
 SUMMARY_EVERY_S = 10.0
@@ -72,6 +74,9 @@ def settings(env):
         raise ValueError(f'V35_RARE={rare!r}: expected one of {RARE_MODES} (rc3 only monitors, it never stops a request)')
     if mode == 'off' and rare == 'off':
         return None
+    rare_name = env.get('V35_RARE_CONFIG', 'rc3')
+    if rare_name not in RARE_CONFIGS:
+        raise ValueError(f'V35_RARE_CONFIG={rare_name!r}: expected one of {tuple(RARE_CONFIGS)}')
     trace = int(env.get('V35_RARE_TRACE', '0') or 0)
     table = env.get('V35_DETECTOR_TABLE')
     if not table and (mode != 'off' or rare == 'shadow'):
@@ -82,7 +87,7 @@ def settings(env):
     if runner not in RUNNERS:
         raise ValueError(f'V35_DETECTOR_RUNNER={runner!r}: expected one of {RUNNERS}')
     s = dict(mode=mode, rare=rare, table=table, think_end=think_end, runner=runner, trace=trace,
-             config=env.get('V35_DETECTOR_CONFIG', CONFIG_M4), rare_config=CONFIG_RC3,
+             config=env.get('V35_DETECTOR_CONFIG', CONFIG_M4), rare_config=RARE_CONFIGS[rare_name], rare_name=rare_name,
              events=env.get('V35_DETECTOR_EVENTS', './v35-detector-events.jsonl'))
     if mode != 'off':
         det = RepDetector(table, s['config'], think_end)     # fails now on a bad table, think_end or config
@@ -94,7 +99,7 @@ def settings(env):
         if s['think_end'] == 'auto':
             s['think_end'] = THINK_END[table]
         if runner == 'sync':                             # loads its tables now; the async worker loads its own copy
-            RareDetector(table, CONFIG_RC3, s['think_end'])
+            RareDetector(table, s['rare_config'], s['think_end'])
     return s
 
 
@@ -281,7 +286,7 @@ class Service:
     def summary(self):
         extra = {}
         if self.rare:                                    # rc3's own detector time, apart from m4's
-            extra = dict(rare=self.s['rare'], rare_seconds_sync=round(self.runner.rare_seconds, 6) if self.runner else 0.0)
+            extra = dict(rare=self.s['rare'], rare_config=self.s['rare_name'], rare_seconds_sync=round(self.runner.rare_seconds, 6) if self.runner else 0.0)
         self.event('summary', mode=self.s['mode'], runner=self.s['runner'], counters=dict(self.n),
                    detector_seconds_sync=round(self.runner.seconds, 6) if self.runner else 0.0, worker=self.worker_stats,
                    open_requests=len(self.tokens), **extra)

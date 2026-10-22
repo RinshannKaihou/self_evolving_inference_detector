@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # H20 上的接入验证与性能测试（docs/INTEGRATION.md §7、§10 的一键版）。在装有 vLLM 0.27.0 的 Python 环境里运行。
 # r3（2026-10-22）：rc3 的两个输入改在 vLLM 采样器里用 Triton 规约采集（V35_RARE=collect|shadow），不再靠请求带 logprobs；
-# 对照组见 bench/online_tpot.py（R3_PROFILES）。
+# r4（2026-10-22）：同样的采集，比较乱码检测器 rc3 与 rc4（V35_RARE_CONFIG=rc3|rc4，默认 rc3）；对照组见 bench/online_tpot.py（R4_PROFILES）。
+# 冒烟默认用 rc4（SMOKE_RARE_CONFIG=rc3 可改）。
 #
 #   bash bench/run_h20.sh env       环境检查：Python 依赖、vLLM 版本、按 wheel RECORD 逐文件核对 vLLM（只允许 5 个被补丁文件里的
 #                                   v35 钩子行）、旧框架补丁是否还在、v35 补丁状态、GPU 占用
@@ -9,11 +10,11 @@
 #   bash bench/run_h20.sh patch     vLLM 补丁（5 个文件）：--check、--apply（已打 r1/r2 补丁时替换为本版），导入与序列化检查，
 #                                   再用真实的 vLLM 文件跑补丁测试
 #   bash bench/run_h20.sh gpucheck  GPU 上核对采样器的 Triton 核与 torch.log_softmax（最大绝对误差）及每次调用的开销
-#   bash bench/run_h20.sh smoke     以 intercept + rc3 shadow 起服务：循环请求被 m4 拦截；强制乱码的请求 rc3 报警但不被拦截；
+#   bash bench/run_h20.sh smoke     以 intercept + rc4（或 rc3）shadow 起服务：循环请求被 m4 拦截；强制乱码的请求 rc3 报警但不被拦截；
 #                                   带 logprobs=1 的请求，采样器采到的两个值与 vLLM 返回的 raw logprobs 一致；
 #                                   不带 logprobs 的请求 rc3 也检查（checked）；然后关服务
-#   bash bench/run_h20.sh cpu       部署机 CPU 基准（m4 与 rc3 每 token 开销、钩子整体开销、状态大小、vLLM 原生检查）
-#   bash bench/run_h20.sh tpot1k    在线 TPOT / CPU / 内存：1K 输出，并发 1 8 32 64，8 个 profile（约 30 分钟）
+#   bash bench/run_h20.sh cpu       部署机 CPU 基准（m4、rc3、rc4 每 token 开销，rc3 / rc4 的静态内存、钩子整体开销、状态大小、vLLM 原生检查）
+#   bash bench/run_h20.sh tpot1k    在线 TPOT / CPU / 内存：1K 输出，并发 1 8 32 64，7 个 profile（约 27 分钟）
 #   bash bench/run_h20.sh tpot8k    8K 输出，并发 1 8 16（r2、r3 不跑：r1 的 8K 被 ignore_eos 诱发的循环干扰）
 #   bash bench/run_h20.sh collect   把 runs/ 和环境信息打包成 v35_h20_results_<主机>_<时间>.tar.gz（在仓库根目录）
 #   bash bench/run_h20.sh all       依次执行 env install patch gpucheck smoke cpu tpot1k collect；任何一步失败都会先打包已有结果再退出
@@ -167,10 +168,10 @@ step_smoke() {
     serve="$(vllm_bin) serve $MODEL --served-model-name bench --host 127.0.0.1 --port $PORT --max-model-len 10240"
     serve="$serve --gpu-memory-utilization .85 --tensor-parallel-size $TP $SERVE_ARGS"
   fi
-  V35_DETECTOR=intercept V35_RARE=shadow V35_RARE_TRACE=4096 V35_DETECTOR_TABLE="$TABLE" V35_DETECTOR_EVENTS="$dir/events.jsonl" \
+  V35_DETECTOR=intercept V35_RARE=shadow V35_RARE_CONFIG="${SMOKE_RARE_CONFIG:-rc4}" V35_RARE_TRACE=4096 V35_DETECTOR_TABLE="$TABLE" V35_DETECTOR_EVENTS="$dir/events.jsonl" \
     CUDA_VISIBLE_DEVICES="$GPU" "$PY" "$REPO/bench/smoke_intercept.py" --serve "$serve" --url "http://127.0.0.1:$PORT" \
     --events "$dir/events.jsonl" --server-log "$dir/server.log" --rare --table "$TABLE" | tee "$dir/smoke.txt"
-  log "冒烟通过：m4 拦截；rc3 报警不拦截；采样器的值与 vLLM 返回的 logprobs 一致；不带 logprobs 的请求 rc3 也检查"
+  log "冒烟通过（${SMOKE_RARE_CONFIG:-rc4}）：m4 拦截；乱码检测报警不拦截；采样器的值与 vLLM 返回的 logprobs 一致；不带 logprobs 的请求也检查"
 }
 
 step_cpu() {

@@ -140,3 +140,49 @@ def test_state_is_bounded():
         sizes.append(_bytes(st))
     assert len(st.f['ring']) <= 64 and len(st.hold) == 3
     assert sizes[1] <= sizes[0] + 64 and sizes[1] < 16 * 1024      # does not grow with the stream
+
+
+# ------------------------------------------------------------------ rc4 (research commit 5118334): "gate": "fs", "ref": "cats"
+from v35_detector import CONFIG_RC4  # noqa: E402
+
+RC4 = json.load(open(CONFIG_RC4))
+
+
+@pytest.mark.parametrize('corpus', ['qwen3', 'glm', 'dsv4'])
+def test_rc4_stream_equals_whole_record(corpus):
+    """rc4 streams like rc3 (one token behind, any chunking); its learned score needs no reference table, so it also runs on
+    DeepSeek"""
+    det = RareDetector(corpus, RC4)
+    assert det.gbm is not None and det.gbm.gate == 'fs' and 'u' not in det.ref
+    rng = np.random.default_rng(9)
+    T = load_rare(corpus)
+    word = next(int(i) for i in _pool(T, 'latin', True) if T['bytes'][i].decode().strip().isalpha() and len(T['bytes'][i]) > 4)
+    fired = 0
+    for seed in range(8):
+        tok, lp1, lpc = synth(corpus, 1500, seed, han_share=0.05 * (seed % 4))
+        if seed % 2 == 0:
+            tok[700], tok[701] = word, int(_pool(T, 'han', False)[seed])
+        strict, mon = stream(det, tok, lp1, lpc, rng)
+        assert strict == decide(tok, lp1, lpc, corpus, RC4), (corpus, seed)
+        assert mon == decide(tok, lp1, lpc, corpus, RC4, tier='monitor'), (corpus, seed)
+        fired += mon[0] >= 0
+    assert fired > 0
+
+
+def test_rc4_gate_is_minority_letters_and_bad_utf8():
+    from v35_detector import rare as R
+    det = RareDetector('qwen3', RC4)
+    tok, lp1, lpc = synth('qwen3', 2000, 4, han_share=0.1)
+    F = R.record_features(det, tok, lp1, lpc)
+    assert (R.gb_gate_mask(F) == ((F['fs'] < R.GB_GATE['fs']) | F['bad_utf8'])).all()
+
+
+def test_rc4_config_keys_are_checked():
+    with pytest.raises(ValueError):                      # "ref": "cats" needs "gate": "fs"
+        RareDetector('qwen3', dict(RC4, gate='full'))
+    with pytest.raises(ValueError):
+        RareDetector('qwen3', dict(RC4, gate='other'))
+    with pytest.raises(ValueError):                      # no rule on a reference feature without reference tables
+        RareDetector('qwen3', dict(RC4, rules=RC4['rules'] + [{'and': [{'f': 'u', 'lt': -6}]}]))
+    rc3 = RareDetector('qwen3', RC3)                     # rc3 (no gate / ref keys): full gate, reference tables
+    assert rc3.gate == 'full' and 'u' in rc3.ref and rc3.gbm.gate == 'full'

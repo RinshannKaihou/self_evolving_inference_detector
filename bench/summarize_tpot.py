@@ -14,10 +14,11 @@ processes.
 import json
 import sys
 
-ORDER = ['baseline', 'collect_only', 'rc3_sync', 'rc3_async', 'baseline_logprobs', 'rc3_shadow_sync', 'rc3_shadow_async',
+ORDER = ['baseline', 'collect_only', 'rc3_sync', 'rc3_async', 'rc4_sync', 'rc4_async', 'm4_rc4_sync', 'm4_rc4_async',
+         'baseline_logprobs', 'rc3_shadow_sync', 'rc3_shadow_async',
          'm4_rc3_sync', 'm4_rc3_async', 'vllm_default', 'vllm_tuned', 'v35_sync', 'v35_async', 'baseline_end']
 RC3 = ['rc3_shadow_sync', 'rc3_shadow_async', 'm4_rc3_sync', 'm4_rc3_async']      # r2
-RC3_R3 = ['rc3_sync', 'rc3_async', 'm4_rc3_sync', 'm4_rc3_async']
+RC3_R3 = ['rc3_sync', 'rc3_async', 'm4_rc3_sync', 'm4_rc3_async', 'rc4_sync', 'rc4_async', 'm4_rc4_sync', 'm4_rc4_async']   # r3, r4
 W = 19
 
 
@@ -58,14 +59,14 @@ def detector_lines(prof, s):
             out.append(f'{prof}: m4 {1e6 * s["detector_seconds_sync"] / max(c.get("tokens", 0), 1):.2f} us/token in the '
                        f'output loop ({c.get("tokens", 0)} tokens)')
     if s.get('rare', 'off') == 'collect':
-        out.append(f'{prof}: rc3 collect only: sampler values for {c.get("rare_values", 0)} tokens, '
+        out.append(f'{prof}: rare_chars collect only: sampler values for {c.get("rare_values", 0)} tokens, '
                    f'{c.get("rare_requests", 0)} requests')
     elif s.get('rare', 'off') != 'off':
         if w:
-            out.append(f'{prof}: rc3 {1e6 * w.get("rare_seconds", 0) / max(w.get("rare_tokens", 0), 1):.2f} us/token in the '
+            out.append(f'{prof}: {s.get("rare_config", "rc3")} {1e6 * w.get("rare_seconds", 0) / max(w.get("rare_tokens", 0), 1):.2f} us/token in the '
                        f'detector process ({w.get("rare_tokens", 0)} tokens)')
         else:
-            out.append(f'{prof}: rc3 {1e6 * s.get("rare_seconds_sync", 0) / max(c.get("rare_tokens", 0), 1):.2f} us/token in '
+            out.append(f'{prof}: {s.get("rare_config", "rc3")} {1e6 * s.get("rare_seconds_sync", 0) / max(c.get("rare_tokens", 0), 1):.2f} us/token in '
                        f'the output loop ({c.get("rare_tokens", 0)} tokens)')
     out.append(f'{prof}: counters {c}')
     return out
@@ -139,17 +140,17 @@ def r3_tables(rows, rc3):
         return None if a is None or b is None else a[key] - b[key]
 
     for title, key, unit, base_fmt, fmt, scale in (
-            ('r3: server TPOT; drift = baseline_end - baseline; collect = collect_only - baseline (sampler kernels + '
-             'transport); +profile = profile - collect_only (rc3 increment); logprobs_path = baseline_logprobs - baseline '
+            ('r3/r4: server TPOT; drift = baseline_end - baseline; collect = collect_only - baseline (sampler kernels + '
+             'transport); +profile = profile - collect_only (rc3 / rc4 increment); logprobs_path = baseline_logprobs - baseline '
              "(r2's way)", 'server_tpot_ms', 'us/token', lambda r: f'{r["server_tpot_ms"]:.3f}ms', lambda v: f'{v:+.1f}',
              1e3),
-            ('r3: client TPOT, same differences', 'client_tpot_ms', 'us/token', lambda r: f'{r["client_tpot_ms"]:.3f}ms',
+            ('r3/r4: client TPOT, same differences', 'client_tpot_ms', 'us/token', lambda r: f'{r["client_tpot_ms"]:.3f}ms',
              lambda v: f'{v:+.1f}', 1e3),
-            ('r3: throughput, same differences', 'tokens_per_second', 'tokens/s', lambda r: f'{r["tokens_per_second"]:.1f}',
+            ('r3/r4: throughput, same differences', 'tokens_per_second', 'tokens/s', lambda r: f'{r["tokens_per_second"]:.1f}',
              lambda v: f'{v:+.1f}', 1.0),
-            ('r3: server CPU (whole tree), same differences', 'server_cpu_cores', 'cores',
+            ('r3/r4: server CPU (whole tree), same differences', 'server_cpu_cores', 'cores',
              lambda r: f'{r["server_cpu_cores"]:.2f}', lambda v: f'{v:+.3f}', 1.0),
-            ('r3: API server process CPU, same differences', 'api_server_cpu_cores', 'cores',
+            ('r3/r4: API server process CPU, same differences', 'api_server_cpu_cores', 'cores',
              lambda r: f'{r["api_server_cpu_cores"]:.2f}', lambda v: f'{v:+.3f}', 1.0)):
         out += [title, f'len    C  {"baseline":>{W}s}' + ''.join(f'{c:>{W}s}' for c in cols) + f'   ({unit})']
         for (length, conc), by in sorted(rows.items()):

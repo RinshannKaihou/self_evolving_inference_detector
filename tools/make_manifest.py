@@ -15,14 +15,15 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PKG = os.path.join(REPO, 'src', 'v35_detector')
 SHIPPED = ['configs/m4.json', 'tables/qwen3.npz', 'tables/glm.npz', 'tables/dsv4.npz',
            'configs/rc3.json', 'tables/qwen3_rare.npz', 'tables/glm_rare.npz', 'tables/dsv4_rare.npz', 'tables/qwen3_rcref.npz',
-           'tables/glm_rcref.npz', 'tables/rc3_gb.npz']
+           'tables/glm_rcref.npz', 'tables/rc3_gb.npz', 'configs/rc4.json', 'tables/rc4_gb.npz']
 LOGIC = ['core.py', 'offline.py', 'trees.py', 'rare_gb.py']   # byte copies of the research repo's detector/
 EDITED = {'stream.py': 'module docstring; RepDetector.__init__ accepts a .npz table path (think_end must then be given)',
           'vocab.py': 'tokenizer paths from the command line instead of the research repo; load() accepts a .npz path',
           'rare.py': "module docstring example; the config's model path ('detector/tables/<file>') resolves to the package's tables/; "
                      "RareDetector.__init__ accepts a .npz table path (think_end must then be given)",
           'rare_vocab.py': 'relative imports; tokenizer path from the command line; load() accepts a .npz path',
-          'rare_ref.py': 'relative imports; the table builder (needs labelled research data) removed, loading unchanged'}
+          'rare_ref.py': 'relative imports; the table builder (needs labelled research data) removed, loading unchanged '
+                         '(load_cats for rc4 copied as is)'}
 
 
 def sha(path):
@@ -43,7 +44,8 @@ def main():
         files[rel] = mine
     note = ('rare_chars rc3 (rare*.py, configs/rc3.json, tables/*_rare.npz, *_rcref.npz, rc3_gb.npz) was copied from the research '
             "working tree before it was committed; these are the files frozen by sha256 for rc3's one-shot holdout / external run "
-            '(research runs/holdout_ledger.jsonl, 2026-10-22)')
+            '(research runs/holdout_ledger.jsonl, 2026-10-22). rc4 (configs/rc4.json, tables/rc4_gb.npz, the gate / ref keys in rare.py '
+            'and load_cats in rare_ref.py) is research commit 5118334, dev only.')
     out = {'source': {'repo': 'detector_v35', 'commit': commit, 'dir': 'detector/', 'note': note},
            'sha256': files, 'edited': EDITED}
     with open(os.path.join(PKG, 'MANIFEST.json'), 'w') as f:

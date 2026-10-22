@@ -350,7 +350,31 @@ r3 要回答：在采样器里采集要多少钱，rc3 在它之上再加多少�
 - **内存**：只采集时 API server 不变；sync 时 API server 多约 58 MB，async 时检测进程 101–105 MB。
 - 两个 server.log 在关服务（SIGTERM）之后有 `EngineDeadError`，与 r1、r2 相同，属于 vLLM 关服时序。
 
-### 10.5 新模型
+### 10.5 r4：rc4 与 rc3 的同轮对比（H20，交接包 r4，待测）
+
+rc4（接口说明 §9.8）与 rc3 的输入和采集完全相同，r3 的 5 个文件、35 行补丁不变；只多一个开关 `V35_RARE_CONFIG=rc3|rc4`（默认 rc3）。
+r4 要回答：rc4 在线的开销是否不高于 rc3（预期更低：学习打分只在约 0.2% 的 token 上算，不查参照表）。
+
+| profile | `V35_RARE` | `V35_RARE_CONFIG` | m4 | 运行方式 | 作用 |
+|---|---|---|---|---|---|
+| baseline | off | — | 关 | — | 基线 |
+| collect_only | collect | — | 关 | — | 减 baseline = 采集成本（与 r3 对照） |
+| rc3_sync | shadow | rc3 | 关 | sync | 减 collect_only = rc3 的增量（同轮参照） |
+| rc4_sync | shadow | rc4 | 关 | sync | 减 collect_only = **rc4 的增量** |
+| rc4_async | shadow | rc4 | 关 | async | 同上，异步 |
+| m4_rc4_sync | shadow | rc4 | shadow | sync | 减 collect_only = m4 + rc4 一起的增量 |
+| baseline_end | off | — | 关 | — | 减 baseline = 漂移 |
+
+- 协议同 r3：1K 输出，并发 1 / 8 / 32 / 64，每档 1 个预热、2 个正式 wave；7 个 profile 约 27 分钟。r2 的 logprobs 路径已测过，不再测。
+- 判读：`runs/summary.txt` 开头的表里，`+rc3_sync` 与 `+rc4_sync` 是同一轮、同一采集之上的增量，可以直接比；比漂移小的差都不可区分。
+  另看每个 profile 的检测器自身耗时（`rc3 x us/token`、`rc4 x us/token`，真实生成流）与内存（sync 时 API server 的 PSS、async 时检测进程的 PSS）。
+- CPU 基准（`runs/cpu_bench_h20.json`）：`rare_static_mb` / `rc4_static_mb` 是两者的 tracemalloc 常驻内存（各在新进程里测）；
+  `hooks_us_per_token` 的 `rc3` / `rc4` / `m4_rc4` 是同一批英文式合成流上钩子整体的每 token 开销（两者都不报警，可比）。
+  `rc4_us_per_token` 在混杂文字的合成流上很快报警停下，只覆盖少量 token，不用于比较。
+- 冒烟默认用 rc4：m4 照常拦截；rc4 对强制的非法 UTF-8 报 `bad_utf8` 而请求跑满；每个请求的 `rare` 都是 `checked`；采样器的值与 vLLM 返回的
+  logprobs 一致。
+
+### 10.6 新模型
 
 - 建 rare 词表（`python -m v35_detector.rare_vocab`）；
 - 学习打分依赖用该模型带标签的正常输出统计的参照表，没有参照表时它不触发，只剩机制规则（DeepSeek 就是这种情况）。

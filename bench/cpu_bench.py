@@ -7,7 +7,7 @@ near-verbatim loops, character runs and circling sentences. The detector is fed 
 alert, as in production. Best of --rounds rounds. The research repo measured the same detector on its real dev records
 (3.43 us/token on an Apple M3 Pro); running this script on both machines translates that figure to the server.
 
-rc3 (garbled-output monitor) gets the same token streams with synthetic logprobs (no real logprobs in this repo). Random
+rc3 and rc4 (garbled-output monitor) get the same token streams with synthetic logprobs (no real logprobs in this repo). Random
 word sequences put far more tokens through the learned score's gate than real outputs do (rare_gb_gate_share here, about 1%
 on real outputs), so its per-token figure overstates the real cost (research repo, real dev records: 0.76 us/token on an
 Apple M3 Pro). 'hooks' times the whole sync path of serving/hooks.py per token (buffering, 64-token blocks, events) for m4,
@@ -35,7 +35,9 @@ from synth import KINDS, make  # noqa: E402
 from test_state import state_bytes  # noqa: E402
 from test_rare import synth as rare_synth  # noqa: E402
 from test_vllm_rule import upstream  # noqa: E402
-from v35_detector import CONFIG_M4, CONFIG_RC3, RareDetector, RepDetector  # noqa: E402
+from v35_detector import CONFIG_M4, CONFIG_RC3, CONFIG_RC4, RareDetector, RepDetector  # noqa: E402
+
+RARE_CFG = {'rc3': CONFIG_RC3, 'rc4': CONFIG_RC4}
 from v35_detector import rare as R  # noqa: E402
 from v35_detector.serving import hooks  # noqa: E402
 
@@ -71,16 +73,43 @@ def rss():
         return None
 
 
-def bench_rare(table, streams, rounds):
+STATIC = '''
+import json, os, sys, tracemalloc
+sys.path.insert(0, sys.argv[1])
+import numpy as np
+from v35_detector import CONFIG_RC3, CONFIG_RC4, RareDetector
+try:
+    import psutil
+    m0 = psutil.Process().memory_info().rss
+except ImportError:
+    psutil = None
+tracemalloc.start()
+det = RareDetector(sys.argv[2], {'rc3': CONFIG_RC3, 'rc4': CONFIG_RC4}[sys.argv[3]])
+st, n = det.start(), 2000
+det.feed(st, np.random.default_rng(0).integers(0, 150000, n), np.full(n, -0.1), np.full(n, -0.5))
+det.finish(st)
+kept, peak = tracemalloc.get_traced_memory()
+print(json.dumps([kept, peak, None if psutil is None else psutil.Process().memory_info().rss - m0]))
+'''
+
+
+def static_memory(table, name):
+    """tables of one configuration in a fresh process (rc3 and rc4 share caches): retained and peak (tracemalloc), RSS growth"""
+    import subprocess
+    out = subprocess.run([sys.executable, '-c', STATIC, os.path.join(HERE, '..', 'src'), table, name], capture_output=True,
+                         text=True, check=True).stdout
+    kept, peak, grown = json.loads(out.strip().splitlines()[-1])
+    return kept / 2 ** 20, peak / 2 ** 20, None if grown is None else grown / 2 ** 20
+
+
+def bench_rare(table, streams, rounds, name='rc3'):
+    """per-token cost on the synthetic streams and static memory of one rare_chars configuration; keys rare_* for rc3 (as
+    before), rc4_* for rc4"""
     rng = np.random.default_rng(0)
     data = [(tok, *synthetic_logprobs(len(tok), rng)) for _, tok in streams]
-    m0 = rss()
-    tracemalloc.start()                                  # the per-process tables: what stays allocated, and the peak
-    det = RareDetector(table, CONFIG_RC3)
+    kept, peak, grown = static_memory(table, name)
+    det = RareDetector(table, RARE_CFG[name])
     run_rare(det, *data[0])                              # first use builds the per-token input table
-    kept, peak = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-    m1 = rss()
     gate = [0, 0]
     mask = R.gb_gate_mask
 
@@ -99,10 +128,17 @@ def bench_rare(table, streams, rounds):
             fed_total += run_rare(det, *d)[0]
         dt = time.perf_counter() - t0
         best = dt if best is None else min(best, dt)
-    return dict(rare_us_per_token=1e6 * best / fed_total, rare_tokens_fed=fed_total,
-                rare_gb_gate_share=gate[0] / max(gate[1], 1), rare_state_bytes_max=max(state_bytes(st) for st in states),
-                rare_static_mb=kept / 2 ** 20, rare_load_peak_mb=peak / 2 ** 20,
-                rare_load_rss_mb=None if m0 is None else (m1 - m0) / 2 ** 20, rare_note=NOTE_RC3)
+    k = 'rare' if name == 'rc3' else name
+    out = {f'{k}_us_per_token': 1e6 * best / fed_total, f'{k}_tokens_fed': fed_total,
+           f'{k}_gb_gate_share': gate[0] / max(gate[1], 1), f'{k}_state_bytes_max': max(state_bytes(st) for st in states),
+           f'{k}_static_mb': kept, f'{k}_load_peak_mb': peak, f'{k}_load_rss_mb': grown}
+    if name == 'rc3':
+        out['rare_note'] = NOTE_RC3
+    else:
+        out[f'{k}_note'] = (f'{name} stops at its first strict alert, which comes early on these mixed-script synthetic streams '
+                            f'({k}_tokens_fed): compare rc3 and {name} on hooks_us_per_token (English-like streams, no alert) and '
+                            'on the online run instead')
+    return out
 
 
 def bench_hooks(table, rounds, seeds=4):
@@ -121,8 +157,10 @@ def bench_hooks(table, rounds, seeds=4):
                                         ('rc3_collect', 'off', 'collect', True),
                                         ('rc3', 'off', 'shadow', True), ('rc3_buffering_only', 'off', 'shadow', True),
                                         ('m4_rc3', 'shadow', 'shadow', True),
-                                        ('m4_rc3_no_values', 'shadow', 'shadow', False)):
+                                        ('m4_rc3_no_values', 'shadow', 'shadow', False),
+                                        ('rc4', 'off', 'shadow', True), ('m4_rc4', 'shadow', 'shadow', True)):
             svc = hooks.Service(hooks.settings({'V35_DETECTOR': m4, 'V35_RARE': rare, 'V35_DETECTOR_TABLE': table,
+                                                'V35_RARE_CONFIG': 'rc4' if 'rc4' in name else 'rc3',
                                                 'V35_DETECTOR_EVENTS': os.path.join(tmp, name + '.jsonl')}))
             if name == 'rc3_buffering_only':             # the hook's own work: the detector is replaced by a no-op
                 svc.register('-')
@@ -185,6 +223,7 @@ def main():
                state_bytes_max=max(state_bytes(st) for st in states),
                load_avg_1m=os.getloadavg()[0] if hasattr(os, 'getloadavg') else None)
     out.update(bench_rare(a.table, streams, a.rounds))
+    out.update(bench_rare(a.table, streams, a.rounds, 'rc4'))
     out.update(bench_hooks(a.table, a.rounds))
     if a.vllm:
         try:                                             # the installed vLLM's own function, as its scheduler calls it

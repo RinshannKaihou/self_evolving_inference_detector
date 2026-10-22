@@ -153,11 +153,13 @@ def test_settings_are_checked_at_start_up(tmp_path):
 
 # ------------------------------------------------------------------ rc3 (V35_RARE=shadow | collect): monitor only
 from test_rare import _pool, synth as rare_synth  # noqa: E402
-from v35_detector import CONFIG_RC3  # noqa: E402
+from v35_detector import CONFIG_RC3, CONFIG_RC4  # noqa: E402
 from v35_detector import rare as R  # noqa: E402
 from v35_detector.rare_vocab import load as load_rare  # noqa: E402
 
 RC3 = json.load(open(CONFIG_RC3))
+RC4 = json.load(open(CONFIG_RC4))
+RARE_CFG = {'rc3': RC3, 'rc4': RC4}
 
 
 def values(top1, chosen):
@@ -181,10 +183,10 @@ def rare_stream(corpus, seed, n=1500):
     return tok, lp1.astype(np.float32).astype(np.float64), lpc.astype(np.float32).astype(np.float64)
 
 
-def rare_service(tmp_path, corpus='qwen3', mode='off', runner='sync', rare='shadow', trace=0):
+def rare_service(tmp_path, corpus='qwen3', mode='off', runner='sync', rare='shadow', trace=0, config='rc3'):
     env = {'V35_DETECTOR': mode, 'V35_RARE': rare, 'V35_DETECTOR_TABLE': corpus, 'V35_DETECTOR_RUNNER': runner,
-           'V35_RARE_TRACE': str(trace),
-           'V35_DETECTOR_EVENTS': str(tmp_path / f'events_{corpus}_{mode}_{rare}_{runner}_{trace}.jsonl')}
+           'V35_RARE_TRACE': str(trace), 'V35_RARE_CONFIG': config,
+           'V35_DETECTOR_EVENTS': str(tmp_path / f'events_{corpus}_{mode}_{rare}_{runner}_{trace}_{config}.jsonl')}
     return hooks.Service(hooks.settings(env))
 
 
@@ -210,15 +212,16 @@ def rare_alerts(ev, rid):
     return {e['tier']: (e['fired_at'], e['reason']) for e in ev if e['event'] == 'rare_alert' and e['request_id'] == rid}
 
 
-@pytest.mark.parametrize('runner', ['sync', 'async'])
-def test_rare_shadow_equals_offline_and_never_stops(tmp_path, runner):
-    svc = rare_service(tmp_path, runner=runner)
+@pytest.mark.parametrize('runner,config', [('sync', 'rc3'), ('async', 'rc3'), ('sync', 'rc4'), ('async', 'rc4')])
+def test_rare_shadow_equals_offline_and_never_stops(tmp_path, runner, config):
+    """V35_RARE_CONFIG picks the configuration; the online alerts equal the offline reference of that configuration"""
+    svc = rare_service(tmp_path, runner=runner, config=config)
     want, rng = {}, np.random.default_rng(11)
     for seed in range(6):
         tok, lp1, lpc = rare_stream('qwen3', seed)
         seen, stop = drive(svc, f'r{seed}', tok, lp1, lpc, rng, sleep=0.0001 if runner == 'async' else 0.0)
         assert stop is None and seen == len(tok)         # rc3 never ends a request
-        want[f'r{seed}'] = {t: R.decide(tok, lp1, lpc, 'qwen3', RC3, tier=tier)
+        want[f'r{seed}'] = {t: R.decide(tok, lp1, lpc, 'qwen3', RARE_CFG[config], tier=tier)
                             for t, tier in (('strict', 'intercept'), ('monitor', 'monitor'))}
     svc.close()
     ev = events(svc)
@@ -228,7 +231,7 @@ def test_rare_shadow_equals_offline_and_never_stops(tmp_path, runner):
     assert [e['rare'] for e in ev if e['event'] == 'finish'] == ['checked'] * 6
     assert not [e for e in ev if e['event'] in ('alert', 'error', 'rare_trace')]
     s = [e for e in ev if e['event'] == 'summary'][-1]
-    assert s['counters']['rare_requests'] == 6 and s['counters'].get('intercepts', 0) == 0
+    assert s['counters']['rare_requests'] == 6 and s['counters'].get('intercepts', 0) == 0 and s['rare_config'] == config
     if runner == 'sync':
         assert s['rare_seconds_sync'] > 0 and s['detector_seconds_sync'] == 0.0       # m4 off: only rc3 time
     else:
@@ -386,3 +389,8 @@ def test_rare_settings(tmp_path):
     assert s['rare'] == 'collect' and s['trace'] == 64
     with pytest.raises(ValueError):                      # m4 still needs its table
         hooks.settings({'V35_DETECTOR': 'shadow', 'V35_RARE': 'collect'})
+    assert s['rare_name'] == 'rc3' and s['rare_config'] == CONFIG_RC3          # default: rc3
+    s = hooks.settings({'V35_RARE': 'shadow', 'V35_RARE_CONFIG': 'rc4', 'V35_DETECTOR_TABLE': 'qwen3'})
+    assert s['rare_name'] == 'rc4' and s['rare_config'] == CONFIG_RC4
+    with pytest.raises(ValueError):
+        hooks.settings({'V35_RARE': 'shadow', 'V35_RARE_CONFIG': 'rc5', 'V35_DETECTOR_TABLE': 'qwen3'})

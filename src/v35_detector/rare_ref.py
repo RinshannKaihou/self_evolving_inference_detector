@@ -128,3 +128,16 @@ def load(corpus):
             _CACHE[corpus] = derive({'n': z['n'].astype(np.int64), 'npv': npv.reshape(V, K), 'nnx': nnx.reshape(V, K),
                                      'N': int(z['N'])}, z['fcat'], z['lcat'])
     return _CACHE[corpus]
+
+
+_CATS = {}
+
+
+def load_cats(corpus):
+    """character-category tables only (no counts), for a learned score without reference inputs (rc4, "ref": "cats"): built from
+    the tokenizer's rare_vocab table at load (about 0.1 s), so they exist for every corpus, DeepSeek included"""
+    if corpus not in _CATS:
+        fcat, lcat = cat_tables(corpus)
+        _CATS[corpus] = {'fcat': fcat, 'lcat': lcat, 'lcat_s': np.r_[lcat, 0].astype(np.int64),
+                         'fcat_s': np.r_[fcat, 0].astype(np.int64)}
+    return _CATS[corpus]

@@ -32,6 +32,7 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from online_tpot import stop_server, wait_ready  # noqa: E402
 
+CFG = os.environ.get('V35_RARE_CONFIG', 'rc3')               # the rare_chars configuration the server runs (same env)
 PROMPT = ('Repeat the following line exactly, one copy per line, forever, without any other text:\n'
           'The quick brown fox jumps over the lazy dog.\n')
 PLAIN = 'Write one short English sentence about the weather.\n'
@@ -96,7 +97,7 @@ def check(a):
         if ok and a.rare:
             fin = finish_of(events)
             ok = fin is not None and fin.get('rare') == 'checked' and r['logprob_positions'] == 0
-            print(f'rc3 on the loop request (no logprobs asked): finish rare={fin and fin.get("rare")}, '
+            print(f'{CFG} on the loop request (no logprobs asked): finish rare={fin and fin.get("rare")}, '
                   f'{r["logprob_positions"]} logprobs returned -> {"ok" if ok else "FAILED"}')
     if not ok or not a.rare:
         return ok
@@ -138,7 +139,7 @@ def check_rare(a, offset):
     strict = [e for e in events if e['event'] == 'rare_alert' and e['request_id'] == rid and e['tier'] == 'strict']
     ok = bool(r['completion_tokens'] == n and r['finish_reason'] == 'length' and fin and fin.get('rare') == 'checked'
               and len(strict) == 1 and strict[0]['reason'] == 'bad_utf8')
-    print(f'rc3 garble (token {lone} forced): {r["completion_tokens"]} tokens, finish {r["finish_reason"]}, rc3 strict '
+    print(f'{CFG} garble (token {lone} forced): {r["completion_tokens"]} tokens, finish {r["finish_reason"]}, strict '
           f'alerts {[(e["fired_at"], e["reason"]) for e in strict]} -> {"ok" if ok else "FAILED"}')
     results.append(ok)
     m, k, d1, d2, gap = compare(r, trace, a.tol)
@@ -159,14 +160,14 @@ def check_rare(a, offset):
     errors += [e for e in events if e['event'] == 'error']
     ok = (fin is not None and fin.get('rare') == 'checked' and r['logprob_positions'] == 0
           and not [e for e in events if e['event'] == 'rare_alert' and e['tier'] == 'strict'])
-    print(f'rc3 without logprobs: finish rare={fin and fin.get("rare")}, {r["logprob_positions"]} logprobs returned -> '
+    print(f'{CFG} without logprobs: finish rare={fin and fin.get("rare")}, {r["logprob_positions"]} logprobs returned -> '
           f'{"ok" if ok else "FAILED"}')
     results.append(ok)
     if errors:
         print('events: error', errors[:3])
     ok = all(results) and not errors
     if ok:
-        print('rc3 smoke: ok')
+        print(f'{CFG} smoke: ok')
     return ok
 
 

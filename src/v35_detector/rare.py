@@ -31,6 +31,11 @@ rc3 (runs/explore/rc3_report.md) adds, computed only when a config's rules use t
   cp, cn        log10 P(that category | token)
   gb            learned token score: gradient-boosted trees over GB_INPUTS (detector/rare_gb.py), computed only at the tokens
                 passing gb_gate (about 1% of tokens); -inf elsewhere
+rc4 (runs/explore/rc4_report.md) adds two config keys, both optional (absent = rc3's behaviour):
+  "gate": "fs"   the learned score is evaluated only where fs < 0.05 (a letter of a minority class) or bad_utf8
+  "ref": "cats"  no reference count tables: only the character categories of each token's first / last character (pcat, ncat),
+                 built from the tokenizer at load, so they exist for every corpus (DeepSeek included); needs "gate": "fs", a model
+                 without u / cp / cn inputs and no rule on u / jp / jn / cp / cn
 A config using any of u ... gb sees each token's right neighbour: it runs one token behind the stream, and every one of its
 alerts (any rule) is raised when the token after the triggering one arrives (fired_at = position + 2), or at the end of the
 stream for the last token (fired_at = n). A corpus without a reference table (DeepSeek: no dev data) gets neutral values and
@@ -260,6 +265,7 @@ def _ctx_features(F, tok, prv, nxt, T, ref, gbm, need):
         return
     pcat, ncat = ref['lcat_s'][prv], ref['fcat_s'][nxt]  # index -1 = the 'none' sentinel
     F['pcat'], F['ncat'] = pcat, ncat
+    F['_gate'] = getattr(gbm, 'gate', 'full')
     for k in need:
         if k.startswith('ref:'):
             k = k[4:]
@@ -307,6 +313,8 @@ class _GBScore(Lazy):
 def gb_gate_mask(F):
     """where the learned score is evaluated: fs < 0.05 (a letter of a minority class), bad_utf8, or a context the token rarely
     has on its left / right (cp / cn < -2.5)"""
+    if F.get('_gate') == 'fs':                           # rc4: minority letters and invalid UTF-8 only
+        return (F['fs'] < GB_GATE['fs']) | F['bad_utf8']
     tok, prv, nxt, T, ref = F['_ctx']
     t16 = tok * rare_ref.K
     g = ref['lowp'][t16 + F['pcat']]
@@ -329,7 +337,7 @@ def _tokf(T, ref):
     if '_tokf' not in ref:
         V = len(T['rcls'])
         tf = np.zeros((V + 1, len(_TOKF)))
-        tf[:V] = np.column_stack([T['rcls'], T['first'], T['last'], T['lead'], ref['u'][:V]])
+        tf[:V] = np.column_stack([T['rcls'], T['first'], T['last'], T['lead'], ref['u'][:V] if 'u' in ref else np.zeros(V)])
         tf[V, 0] = 31
         ref['_tokf'] = tf
     return ref['_tokf']
@@ -349,7 +357,7 @@ def gb_inputs(F, idx, quant=0.0, fsw=True):
         r[_GBI['tokf']] = tf[t]
         r[_GBI['pcls']], r[_GBI['ncls']] = tf[int(prv[i]), 0], tf[int(nxt[i]), 0]
         r[_GBI['pcat']], r[_GBI['ncat']] = pc, nc
-        r[_GBI['cp']], r[_GBI['cn']] = ref['cp'][t, pc], ref['cn'][t, nc]
+        r[_GBI['cp']], r[_GBI['cn']] = (ref['cp'][t, pc], ref['cn'][t, nc]) if 'cp' in ref else (0.0, 0.0)
         p3 = np.array((l1, lc, l1 - lc))
         r[_GBI['prob']] = np.round(p3 / quant) * quant if quant else p3
         r[_GBI['fs']], r[_GBI['answer']], r[_GBI['bad_utf8']] = F['fs'][i], F['answer'][i], F['bad_utf8'][i]
@@ -362,7 +370,7 @@ def gb_inputs(F, idx, quant=0.0, fsw=True):
     X[:, _GBI['ncls']] = tf[nxt[idx], 0]
     pc, nc = F['pcat'][idx], F['ncat'][idx]
     X[:, _GBI['pcat']], X[:, _GBI['ncat']] = pc, nc
-    X[:, _GBI['cp']], X[:, _GBI['cn']] = ref['cp'][t, pc], ref['cn'][t, nc]
+    X[:, _GBI['cp']], X[:, _GBI['cn']] = (ref['cp'][t, pc], ref['cn'][t, nc]) if 'cp' in ref else (0.0, 0.0)
     l1, lc = F['lp1'][idx], F['lpc'][idx]
     P = np.column_stack((l1, lc, l1 - lc))
     X[:, _GBI['prob']] = np.round(P / quant) * quant if quant else P
@@ -484,15 +492,24 @@ class RareDetector:
         self.strict = [r.get('tier', 'intercept') != 'monitor' for r in self.rules]
         self.has_gb = [any(a['f'] == 'gb' for a in r['and']) for r in self.rules]
         self.look = 'ref' in self.need                   # context features: one token behind the stream
-        self.ref = rare_ref.load(corpus) if self.look else None
+        self.gate = self.cfg.get('gate', 'full')
+        cats = self.cfg.get('ref') == 'cats'
+        if self.gate not in ('full', 'fs') or self.cfg.get('ref', 'counts') not in ('counts', 'cats'):
+            raise ValueError('unknown "gate" / "ref"')
+        if cats and (self.gate != 'fs' or any(a['f'] in REF for r in self.rules for a in r['and'])):
+            raise ValueError('"ref": "cats" needs "gate": "fs" and no rule on a reference feature')
+        self.ref = (rare_ref.load_cats(corpus) if cats else rare_ref.load(corpus)) if self.look else None
         uses_gb = any(a['f'] == 'gb' for r in self.rules for a in r['and'])
         if uses_gb and 'gb' not in self.cfg:
             raise ValueError('a rule uses gb but the config names no model ("gb": path)')
         self.gbm = GB.load(_repo_path(self.cfg['gb'])) if uses_gb and self.ref is not None else None
         if self.gbm is not None:                         # the model's inputs, a subset of GB_INPUTS in any order
+            if cats and set(self.gbm.inputs) & {'u', 'cp', 'cn'}:
+                raise ValueError('"ref": "cats": the learned score must not use u / cp / cn')
             cols = [GB_INPUTS.index(k) for k in self.gbm.inputs]
             self.gbm.cols = None if cols == list(range(len(GB_INPUTS))) else np.array(cols)
             self.gbm.uses_fsw = 'fsw' in self.gbm.inputs
+            self.gbm.gate = self.gate
 
     def start(self):
         return _StCtx(self.need) if self.look else _St(self.need)

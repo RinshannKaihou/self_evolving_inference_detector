@@ -133,6 +133,7 @@ m4 的 14 个组件，以及 `reason` 的字符串：
 |---|---|---|
 | `V35_DETECTOR` | m4：`off` / `shadow`（只检测、记日志）/ `intercept`（检测、记日志并结束请求） | `off` |
 | `V35_RARE` | rc3：`off` / `collect`（采样器采集并送到前端，只记覆盖，不跑 rc3）/ `shadow`（采集，跑 rc3，只记日志；没有拦截模式）。EngineCore 进程读同一个变量决定采样器是否采集，见 §9.7 | `off` |
+| `V35_RARE_CONFIG` | 乱码检测用哪个配置：`rc3` / `rc4`（§9.8）。输入与采样器采集相同，只换判定 | `rc3` |
 | `V35_RARE_TRACE` | N > 0 时，每个请求前 N 个 token 收到的值写进 `rare_trace` 事件（冒烟测试用来与 vLLM 返回的 logprobs 对比） | `0` |
 | `V35_DETECTOR_TABLE` | `qwen3` / `glm` / `dsv4` / `.npz` 路径（m4 词表）；rc3 只接受内置名 | m4 开启或 `V35_RARE=shadow` 时必填（只 `collect` 时不需要） |
 | `V35_DETECTOR_THINK_END` | `auto` / `none` / token id（两个检测器共用） | `auto` |
@@ -285,3 +286,20 @@ V35_RARE=collect V35_DETECTOR_EVENTS=... vllm serve ...                         
   - r3（适配流程文档 §10.4）：采样器采集的成本（collect_only − baseline）H20 实测 +3.5 / +7.0 / +29.1 / +18.6 μs/token
     （并发 1 / 8 / 32 / 64，时延的 0.07–0.18%），同一轮里 r2 的取数方式 +134 到 +358 μs；rc3 与 m4 的增量与漂移同量级。钩子收值、不跑 rc3 的前端开销在 `bench/cpu_bench.py` 的 `rc3_collect` 一项。
 - **已知限制**：只接 V1 GPU model runner；投机解码不采集（`lost`）；张量并行、流水线并行没有在线验证。
+
+### 9.8 rc4（`CONFIG_RC4`，0.4.0）
+
+rc4 是研究仓提交 5118334（DESIGN §28，`runs/explore/rc4_report.md`）的乱码检测配置，**只在选型集上选型，没有跑留出集与换模型测试**。
+
+- **输入、接口、在线接入与 rc3 完全相同**：`RareDetector(corpus, CONFIG_RC4)`；线上 `V35_RARE=shadow` 加 `V35_RARE_CONFIG=rc4`，采样器采集不变。
+- **配置的两个新键**（`rare.py`，缺省时行为与 rc3 相同）：
+  - `"gate": "fs"`：学习打分只在 fs < 0.05（少数文字的字母）或非法 UTF-8 的 token 上算，约 0.2% 的 token（rc3 约 1.3%）；
+  - `"ref": "cats"`：不用参照表，只用加载时由分词器的表算出的首末字符类别（`rare_ref.load_cats`），所以 DeepSeek 上学习打分也能用。
+    要求 `"gate": "fs"`、学习打分不用 u / cp / cn、规则里没有参照特征。
+- **规则**：严格档 3 条固定规则（`lpc<-4 & fs<0.002 & caseless_after_latin`、`bad_utf8`、`lp1<-2 & fs<0.01`）加 1 条学习打分
+  （`gb>2.07 & gap<0.3`）；监控档再加 2 条。模型 `tables/rc4_gb.npz`（68 棵树）。报警同样晚 1 个 token。
+- **选型集结果**（研究仓，2026-10-22 起的乱码口径，按 prompt 分组 5 折的折外）：严格档 Qwen3 0.823（93/113）、误报 7 条（0.046%），
+  GLM 0.400、0 条；同一口径下 rc3 的选型方法为 0.584、2 条。
+- **一致性**：本仓 rc4 在全部 19,321 条选型集记录上与研究仓逐条一致（严格档 947 次、监控档 1,179 次，0 处差异）。
+- **资源**（本机）：离线每 token 0.61 μs（rc3 0.78，研究仓 `runs/bench_m4g_rc1_rc2_rc3_rc4.json`）；每进程常驻 21 MB、加载峰值 28 MB
+  （tracemalloc，`bench/cpu_bench.py`；rc3 64 / 118 MB）；每请求状态约 1.3–1.6 KB。线上开销待 H20 实测（适配流程文档 §10.5）。

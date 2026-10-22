@@ -6,11 +6,14 @@ Slimmed from the previous online tests (v32_online/online_tpot_run.py): one vLLM
 by this script; every request generates exactly the requested number of tokens (ignore_eos), so all profiles do the same
 work; the detectors run in shadow mode (they detect and log, never stop a request).
 
-Profiles (default: the r3 set, marked *; r1 ran baseline, vllm_*, v35_*, baseline_end). No profile asks for logprobs
-except baseline_logprobs: with r3 rc3 gets its values from the sampler whatever the request asks.
-  baseline, baseline_end *  detectors off; run first and last to measure the drift of the session
-  collect_only *            V35_RARE=collect: the sampler kernels and the transport to the frontend, rc3 itself off
-  rc3_sync *                V35_RARE=shadow (m4 off), sync runner (inside the output-processing loop)
+Profiles (default: the r4 set, marked +; r3 ran baseline, collect_only, rc3_*, m4_rc3_*, baseline_logprobs, baseline_end; r1 ran
+baseline, vllm_*, v35_*, baseline_end). No profile asks for logprobs except baseline_logprobs: since r3 the rare_chars detectors
+get their values from the sampler whatever the request asks.
+  baseline, baseline_end +  detectors off; run first and last to measure the drift of the session
+  collect_only +            V35_RARE=collect: the sampler kernels and the transport to the frontend, rc3 itself off
+  rc3_sync +                V35_RARE=shadow (m4 off), sync runner (inside the output-processing loop)
+  rc4_sync +, rc4_async +   V35_RARE=shadow, V35_RARE_CONFIG=rc4 (m4 off), sync / async runner
+  m4_rc4_sync +, m4_rc4_async   V35_DETECTOR=shadow, V35_RARE=shadow, V35_RARE_CONFIG=rc4
   rc3_async *               V35_RARE=shadow (m4 off), async runner (a separate detector process)
   m4_rc3_sync *             V35_DETECTOR=shadow and V35_RARE=shadow, sync runner
   m4_rc3_async *            V35_DETECTOR=shadow and V35_RARE=shadow, async runner
@@ -21,7 +24,7 @@ except baseline_logprobs: with r3 rc3 gets its values from the sampler whatever 
   v35_sync                  V35_DETECTOR=shadow, sync runner
   v35_async                 V35_DETECTOR=shadow, async runner
 vLLM's check stops a request when it finds a loop; such requests are counted (early_stops) and their tokens kept.
-Collection cost = collect_only - baseline; rc3 increment = rc3_* / m4_rc3_* - collect_only; r2's way = baseline_logprobs -
+Collection cost = collect_only - baseline; rc3 / rc4 increment = rc3_* / rc4_* / m4_rc* - collect_only; r2's way = baseline_logprobs -
 baseline (bench/summarize_tpot.py prints all three next to the drift).
 
 Per (profile, output length, concurrency), over timed waves after warm-up waves:
@@ -68,6 +71,13 @@ PROFILES = {                                             # name: (server environ
     'rc3_async': ({'V35_DETECTOR': 'off', 'V35_RARE': 'shadow', 'V35_DETECTOR_RUNNER': 'async'}, None, None),
     'm4_rc3_sync': ({'V35_DETECTOR': 'shadow', 'V35_RARE': 'shadow', 'V35_DETECTOR_RUNNER': 'sync'}, None, None),
     'm4_rc3_async': ({'V35_DETECTOR': 'shadow', 'V35_RARE': 'shadow', 'V35_DETECTOR_RUNNER': 'async'}, None, None),
+    'rc4_sync': ({'V35_DETECTOR': 'off', 'V35_RARE': 'shadow', 'V35_RARE_CONFIG': 'rc4', 'V35_DETECTOR_RUNNER': 'sync'}, None, None),
+    'rc4_async': ({'V35_DETECTOR': 'off', 'V35_RARE': 'shadow', 'V35_RARE_CONFIG': 'rc4', 'V35_DETECTOR_RUNNER': 'async'}, None,
+                  None),
+    'm4_rc4_sync': ({'V35_DETECTOR': 'shadow', 'V35_RARE': 'shadow', 'V35_RARE_CONFIG': 'rc4', 'V35_DETECTOR_RUNNER': 'sync'},
+                    None, None),
+    'm4_rc4_async': ({'V35_DETECTOR': 'shadow', 'V35_RARE': 'shadow', 'V35_RARE_CONFIG': 'rc4', 'V35_DETECTOR_RUNNER': 'async'},
+                     None, None),
     'baseline_logprobs': ({'V35_DETECTOR': 'off'}, None, 1),
     'baseline_end': ({'V35_DETECTOR': 'off'}, None, None),
     'vllm_default': ({'V35_DETECTOR': 'off'}, {'min_pattern_size': 50, 'max_pattern_size': 500, 'min_count': 3}, None),
@@ -77,6 +87,7 @@ PROFILES = {                                             # name: (server environ
 }
 R3_PROFILES = ['baseline', 'collect_only', 'rc3_sync', 'rc3_async', 'm4_rc3_sync', 'm4_rc3_async', 'baseline_logprobs',
                'baseline_end']
+R4_PROFILES = ['baseline', 'collect_only', 'rc3_sync', 'rc4_sync', 'rc4_async', 'm4_rc4_sync', 'baseline_end']
 NOTES = ('A database keeps a write-ahead log so committed changes can be recovered after a crash. Replication improves '
          'availability, but network latency and consistency requirements affect throughput. A cache reduces repeated reads. '
          'Measurements should distinguish warm caches, cold caches, request concurrency, queueing time, and memory usage.\n')
@@ -302,7 +313,7 @@ def main():
     ap.add_argument('--model', required=True)
     ap.add_argument('--table', default='qwen3', help='V35_DETECTOR_TABLE for the v35 profiles')
     ap.add_argument('--think-end', default='auto', help='V35_DETECTOR_THINK_END')
-    ap.add_argument('--profiles', nargs='+', default=R3_PROFILES, choices=list(PROFILES))
+    ap.add_argument('--profiles', nargs='+', default=R4_PROFILES, choices=list(PROFILES))
     ap.add_argument('--concurrencies', type=int, nargs='+', default=[1, 8, 32, 64])
     ap.add_argument('--output-lengths', type=int, nargs='+', default=[1024])
     ap.add_argument('--input-length', type=int, default=1024)

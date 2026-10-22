@@ -4,9 +4,9 @@ research repo's tools/run_detector.py) over the research repo's dev records and 
 the research repo's saved runs. Needs the research repo and its corpora; dev only (holdout / external are guarded there).
 Exit status 1 on any difference.
   m4  (repetition):  runs/m4_dev_fires.jsonl
-  rc3 (rare_chars):  runs/rc3_dev_fires.jsonl (strict tier) and runs/rc3_monitor_dev_fires.jsonl (monitoring tier), with the same
+  rc3 / rc4 (rare_chars):  runs/<rc>_dev_fires.jsonl (strict tier) and runs/<rc>_monitor_dev_fires.jsonl (monitoring tier), with the same
                      logprob inputs as run_detector.py (the generated token's logprob; where the data lacks it, the 20th logprob)
-  python3 tools/verify_against_research.py --research /Volumes/T7/work/inference_severe_error_monitor/detector_v35 [--detector rc3]
+  python3 tools/verify_against_research.py --research /Volumes/T7/work/inference_severe_error_monitor/detector_v35 [--detector rc3|rc4]
 """
 import argparse
 import json
@@ -19,7 +19,9 @@ import numpy as np
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, 'src'))
-from v35_detector import CONFIG_M4, CONFIG_RC3, RareDetector, RepDetector  # noqa: E402
+from v35_detector import CONFIG_M4, CONFIG_RC3, CONFIG_RC4, RareDetector, RepDetector  # noqa: E402
+
+RARE = {'rc3': CONFIG_RC3, 'rc4': CONFIG_RC4}
 
 _D = {}
 
@@ -39,11 +41,11 @@ def _run_m4(a):
     return key, {'strict': (len(tok), res.fired_at, res.reason)}
 
 
-def _run_rc3(a):
-    key, corpus, tok, lp1, lpc = a
-    if corpus not in _D:
-        _D[corpus] = RareDetector(corpus, CONFIG_RC3)
-    det = _D[corpus]
+def _run_rare(a):
+    name, key, corpus, tok, lp1, lpc = a
+    if (name, corpus) not in _D:
+        _D[(name, corpus)] = RareDetector(corpus, RARE[name])
+    det = _D[(name, corpus)]
     st = det.start()
     res = None
     for i in range(0, len(tok), 64):
@@ -58,7 +60,7 @@ def _run_rc3(a):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--research', required=True)
-    ap.add_argument('--detector', default='m4', choices=('m4', 'rc3'))
+    ap.add_argument('--detector', default='m4', choices=('m4', 'rc3', 'rc4'))
     ap.add_argument('--procs', type=int, default=9)
     ap.add_argument('--out', default=None)
     a = ap.parse_args()
@@ -67,7 +69,7 @@ def main():
     sys.path.insert(0, a.research)
     from dataset.load import iter_records              # the research repo's loader (dev is unguarded)
     stems = {'strict': 'm4_dev_fires.jsonl'} if a.detector == 'm4' else \
-        {'strict': 'rc3_dev_fires.jsonl', 'monitor': 'rc3_monitor_dev_fires.jsonl'}
+        {'strict': f'{a.detector}_dev_fires.jsonl', 'monitor': f'{a.detector}_monitor_dev_fires.jsonl'}
     want = {t: {} for t in stems}
     for t, stem in stems.items():
         for line in open(os.path.join(a.research, 'runs', stem)):
@@ -77,8 +79,8 @@ def main():
     if a.detector == 'm4':
         fn, items = _run_m4, ((r.key, r.corpus, np.asarray(r.token_ids)) for r in iter_records('dev'))
     else:
-        fn = _run_rc3
-        items = ((r.key, r.corpus, np.asarray(r.token_ids), r.top_lps[:, 0],
+        fn = _run_rare
+        items = ((a.detector, r.key, r.corpus, np.asarray(r.token_ids), r.top_lps[:, 0],
                   np.where(np.isnan(r.chosen_lp), r.top_lps[:, -1], r.chosen_lp)) for r in iter_records('dev'))
     got, diff = {t: {} for t in stems}, []
     with Pool(a.procs) as p:

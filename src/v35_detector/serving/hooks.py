@@ -15,23 +15,21 @@ serves requests (each API server process).
 
 Environment, read when this module is imported (a misconfiguration stops the server at start-up):
   V35_DETECTOR            off (default) | shadow (detect and log) | intercept (detect, log and stop the request): m4
-  V35_RARE                off (default) | collect | shadow: the garbled-output monitor rc3. The engine's sampler computes
-                          rc3's two values for every request whatever the request asks (collect.py reads the same
-                          variable); shadow runs rc3 on them, detects and logs, and never stops a request; collect only
-                          receives the values and records coverage (the cost of collection and transport alone)
-  V35_RARE_CONFIG         rc3 (default) | rc4: which garbled-output configuration shadow runs (same inputs, same sampler collection)
-  V35_RARE_TRACE          N > 0: log the first N tokens' values of every request ('rare_trace' events; for the smoke test)
-  V35_DETECTOR_TABLE      qwen3 | glm | dsv4 | /path/to/table.npz (built by v35_detector.vocab); required when m4 or rc3
-                          detects (not for collect alone); rc3 needs a shipped name (its rare and reference tables come with
-                          it)
+  V35_RARE                off (default) | collect | shadow: garbled-output monitoring. rc3/rc4 collect two logprobs per token
+                          in the sampler; shadow detects and logs and never stops a request; collect only records input coverage.
+                          rc1t consumes token ids directly, needs no sampler values and supports shadow only (not collect)
+  V35_RARE_CONFIG         rc3 (default) | rc4 | rc1t: which garbled-output configuration shadow runs; rc1t disables collection
+  V35_RARE_TRACE          N > 0: log the first N tokens' logprob values ('rare_trace' events; rc3/rc4 only, not rc1t)
+  V35_DETECTOR_TABLE      qwen3 | glm | dsv4 | /path/to/table.npz (built by v35_detector.vocab); required when m4 or rare_chars
+                          detects (not for collect alone); rare_chars needs a shipped name (its tables come with it)
   V35_DETECTOR_THINK_END  auto (default; shipped tables only) | none (chat mode) | the '</think>' token id
   V35_DETECTOR_RUNNER     sync (default: inside the output-processing loop) | async (a separate detector process); both
                           detectors run in the same place
-  V35_DETECTOR_CONFIG     m4 config JSON (default: the shipped m4); rc3 always uses the shipped rc3
+  V35_DETECTOR_CONFIG     m4 config JSON (default: the shipped m4); rare_chars uses the selected shipped config
   V35_DETECTOR_EVENTS     JSONL of alerts (m4: 'alert', rc3: 'rare_alert'), interceptions, errors, finished requests and
                           summaries (default ./v35-detector-events.jsonl)
 
-Tokens (and, for rc3, their two values) are buffered per request and handed over in whole 64-token blocks, so the alerts
+Tokens (and, for logprob configs, their two values) are buffered per request and handed over in whole 64-token blocks, so the alerts
 equal the evaluated detectors' under any chunking. Fail-open: an error inside a detector is logged and ends that detector
 for that request; a dead or saturated async worker ends detection for the affected requests. Serving never fails
 because of the detectors. With V35_RARE=off the m4 path is the one tested on the H20 (code tag h20-r1).
@@ -47,7 +45,7 @@ from collections import Counter
 
 import numpy as np
 
-from .. import CONFIG_M4, CONFIG_RC3, CONFIG_RC4
+from .. import CONFIG_M4, CONFIG_RC1T, CONFIG_RC3, CONFIG_RC4
 from ..core import BLOCK
 from ..rare import RareDetector
 from ..stream import RepDetector
@@ -56,7 +54,7 @@ from .worker import rare_step, worker_main
 
 MODES = ('off', 'shadow', 'intercept')
 RARE_MODES = ('off', 'collect', 'shadow')                # rc3 monitors only: there is no intercept mode
-RARE_CONFIGS = {'rc3': CONFIG_RC3, 'rc4': CONFIG_RC4}     # V35_RARE_CONFIG
+RARE_CONFIGS = {'rc3': CONFIG_RC3, 'rc4': CONFIG_RC4, 'rc1t': CONFIG_RC1T}     # V35_RARE_CONFIG
 RUNNERS = ('sync', 'async')
 STOP_PREFIX = 'v35_repetition: '
 SUMMARY_EVERY_S = 10.0
@@ -77,7 +75,12 @@ def settings(env):
     rare_name = env.get('V35_RARE_CONFIG', 'rc3')
     if rare_name not in RARE_CONFIGS:
         raise ValueError(f'V35_RARE_CONFIG={rare_name!r}: expected one of {tuple(RARE_CONFIGS)}')
+    rare_token_only = rare_name == 'rc1t'
+    if rare_token_only and rare == 'collect':
+        raise ValueError('V35_RARE=collect is for logprob configs; rc1t uses token ids directly (use shadow or off)')
     trace = int(env.get('V35_RARE_TRACE', '0') or 0)
+    if rare_token_only and rare != 'off' and trace:
+        raise ValueError('V35_RARE_TRACE records logprobs and is not available with rc1t')
     table = env.get('V35_DETECTOR_TABLE')
     if not table and (mode != 'off' or rare == 'shadow'):
         raise ValueError('V35_DETECTOR_TABLE is required (qwen3 | glm | dsv4 | path to a .npz table)')
@@ -88,7 +91,7 @@ def settings(env):
         raise ValueError(f'V35_DETECTOR_RUNNER={runner!r}: expected one of {RUNNERS}')
     s = dict(mode=mode, rare=rare, table=table, think_end=think_end, runner=runner, trace=trace,
              config=env.get('V35_DETECTOR_CONFIG', CONFIG_M4), rare_config=RARE_CONFIGS[rare_name], rare_name=rare_name,
-             events=env.get('V35_DETECTOR_EVENTS', './v35-detector-events.jsonl'))
+             rare_token_only=rare_token_only, events=env.get('V35_DETECTOR_EVENTS', './v35-detector-events.jsonl'))
     if mode != 'off':
         det = RepDetector(table, s['config'], think_end)     # fails now on a bad table, think_end or config
         s['think_end'] = det.think_end
@@ -268,6 +271,7 @@ class Service:
         self.m4 = s['mode'] != 'off'
         self.rare = s['rare'] != 'off'                   # rc3 values are received and their coverage recorded
         self.rare_detect = s['rare'] == 'shadow'         # ... and rc3 runs on them (collect: it does not)
+        self.rare_token_only = s.get('rare_token_only', False)
         self.needs_runner = self.m4 or self.rare_detect
         self.rare_wait = set()                           # rc3: registered, no token yet (whether values come is unknown)
         self.rare_pending = {}                           # rc3: rid -> (ids, top-1 logprobs, chosen logprobs) (< BLOCK each;
@@ -379,8 +383,8 @@ class Service:
         n = len(token_ids)
         if not n:
             return
-        ok = type(values) is list and len(values) == 2 * n      # what the patched engine sends: two floats per token
-        if ok:
+        ok = self.rare_token_only or (type(values) is list and len(values) == 2 * n)
+        if ok and not self.rare_token_only:
             self.n['rare_values'] += n
         if ok and self.trace:
             tr = self.rare_trace.get(rid)
@@ -393,7 +397,7 @@ class Service:
             if rid not in self.rare_wait:                # not checked by rc3 (no values, ended, error, not registered)
                 return
             self.rare_wait.discard(rid)                  # the request's first tokens decide whether rc3 can check it
-            if values is None:
+            if values is None and not self.rare_token_only:
                 self.rare_status[rid] = 'no_values'
                 self.n['rare_no_values'] += 1
                 return
@@ -415,16 +419,18 @@ class Service:
         try:
             ids, top1, chosen = buf
             ids.extend(token_ids)
-            if n == 1:
-                top1.append(values[0])
-                chosen.append(values[1])
-            else:
-                top1.extend(values[0::2])
-                chosen.extend(values[1::2])
+            if not self.rare_token_only:
+                if n == 1:
+                    top1.append(values[0])
+                    chosen.append(values[1])
+                else:
+                    top1.extend(values[0::2])
+                    chosen.extend(values[1::2])
             if len(ids) >= BLOCK:
                 k = len(ids) - len(ids) % BLOCK
-                hits, done = self.runner.rare_feed(rid, np.asarray(ids[:k], np.int64), np.asarray(top1[:k], np.float64),
-                                                   np.asarray(chosen[:k], np.float64))
+                lp1 = None if self.rare_token_only else np.asarray(top1[:k], np.float64)
+                lpc = None if self.rare_token_only else np.asarray(chosen[:k], np.float64)
+                hits, done = self.runner.rare_feed(rid, np.asarray(ids[:k], np.int64), lp1, lpc)
                 self.n['rare_tokens'] += k
                 del ids[:k], top1[:k], chosen[:k]
                 for h in hits:
@@ -435,16 +441,17 @@ class Service:
             self.rare_fail(rid, e, 'rare_feed')
 
     def rare_finish(self, rid):
-        """rc3 coverage of the request: checked (values for every token; rc3 ran on all of them, or up to its strict alert)
-        | no_values (the engine sent no values: collection off in the engine, or a path that does not collect) | lost
-        (values stopped coming) | error | none (no token, or detection unavailable)"""
+        """rare_chars coverage: checked (all tokens checked, or up to the strict alert; rc1t needs no values)
+        | no_values (a logprob config got no values: collection off or an unsupported engine path) | lost
+        (logprob values stopped coming) | error | none (no token, or detection unavailable)"""
         self.rare_wait.discard(rid)
         buf = self.rare_pending.pop(rid, None)
         if buf is not None and self.rare_detect:
             try:
                 ids, top1, chosen = buf
-                hits = self.runner.rare_finish(rid, np.asarray(ids, np.int64), np.asarray(top1, np.float64),
-                                               np.asarray(chosen, np.float64))
+                lp1 = None if self.rare_token_only else np.asarray(top1, np.float64)
+                lpc = None if self.rare_token_only else np.asarray(chosen, np.float64)
+                hits = self.runner.rare_finish(rid, np.asarray(ids, np.int64), lp1, lpc)
                 self.n['rare_tokens'] += len(ids)
                 for h in hits:
                     self.rare_log(rid, *h, after_end=True)

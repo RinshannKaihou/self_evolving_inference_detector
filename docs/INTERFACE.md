@@ -1,6 +1,6 @@
-# 接口说明：v35 检测器（循环输出 m4、乱码监控 rc3）
+# 接口说明：v35 检测器（循环输出 m4、乱码监控 rc3 / rc4 / rc1t）
 
-版本 0.3.0。判定逻辑与研究仓库 `detector_v35` 被评测的版本逐字节相同（`src/v35_detector/MANIFEST.json`）。§1–§8 是循环输出检测器 m4；§9 是乱码检测器 rc3（离线接口，以及同一组 vLLM 钩子上的在线监控）。
+版本 0.5.0。判定逻辑、配置与静态表的来源及 SHA-256 见 `src/v35_detector/MANIFEST.json`。§1–§8 是循环输出检测器 m4；§9 是 rare_chars（rc3 的接口与在线监控，rc4 / rc1t 见 §9.8 / §9.9）。
 
 ## 1. 适用范围
 
@@ -132,13 +132,13 @@ m4 的 14 个组件，以及 `reason` 的字符串：
 | 变量 | 取值 | 默认 |
 |---|---|---|
 | `V35_DETECTOR` | m4：`off` / `shadow`（只检测、记日志）/ `intercept`（检测、记日志并结束请求） | `off` |
-| `V35_RARE` | rc3：`off` / `collect`（采样器采集并送到前端，只记覆盖，不跑 rc3）/ `shadow`（采集，跑 rc3，只记日志；没有拦截模式）。EngineCore 进程读同一个变量决定采样器是否采集，见 §9.7 | `off` |
-| `V35_RARE_CONFIG` | 乱码检测用哪个配置：`rc3` / `rc4`（§9.8）。输入与采样器采集相同，只换判定 | `rc3` |
-| `V35_RARE_TRACE` | N > 0 时，每个请求前 N 个 token 收到的值写进 `rare_trace` 事件（冒烟测试用来与 vLLM 返回的 logprobs 对比） | `0` |
-| `V35_DETECTOR_TABLE` | `qwen3` / `glm` / `dsv4` / `.npz` 路径（m4 词表）；rc3 只接受内置名 | m4 开启或 `V35_RARE=shadow` 时必填（只 `collect` 时不需要） |
+| `V35_RARE` | rare_chars：`off` / `collect`（rc3/rc4 只采集并记覆盖）/ `shadow`（只检测、记日志，没有拦截模式）。rc1t 只支持 off/shadow，不需要采样器采集，见 §9.9 | `off` |
+| `V35_RARE_CONFIG` | `rc3` / `rc4` / `rc1t`。rc3/rc4 使用采样器采集的 logprob；rc1t 只读 token id 并禁用采集 | `rc3` |
+| `V35_RARE_TRACE` | N > 0 时，每个请求前 N 个 token 收到的 logprob 写进 `rare_trace` 事件；只适用于 rc3/rc4，不适用于 rc1t | `0` |
+| `V35_DETECTOR_TABLE` | `qwen3` / `glm` / `dsv4` / `.npz` 路径（m4 词表）；rare_chars 只接受内置名 | m4 开启或 `V35_RARE=shadow` 时必填（只 `collect` 时不需要） |
 | `V35_DETECTOR_THINK_END` | `auto` / `none` / token id（两个检测器共用） | `auto` |
 | `V35_DETECTOR_RUNNER` | `sync`（在输出处理循环里算）/ `async`（独立检测进程）；两个检测器在同一处算 | `sync` |
-| `V35_DETECTOR_CONFIG` | m4 配置 JSON 路径（rc3 固定用内置 rc3） | 内置 m4 |
+| `V35_DETECTOR_CONFIG` | m4 配置 JSON 路径（rare_chars 使用内置配置） | 内置 m4 |
 | `V35_DETECTOR_EVENTS` | 事件日志路径（JSONL） | `./v35-detector-events.jsonl` |
 
 事件日志每行一个 JSON，公共字段为 `ts`、`pid`、`event`：
@@ -305,3 +305,48 @@ rc4 是研究仓提交 5118334（DESIGN §28，`runs/explore/rc4_report.md`）�
   （tracemalloc，`bench/cpu_bench.py`；rc3 64 / 118 MB）；每请求状态约 1.3–1.6 KB。
   H20 实测（交接包 r4，适配流程文档 §10.5）：时延增量测不出；检测器每 token 2.0–2.4 μs（sync）、3.15 μs（async），同一轮的 rc3 为 4.68 μs；
   async 检测进程 PSS 43 MB。
+
+### 9.9 rc1t（`CONFIG_RC1T`，0.5.0）：token-only rare_chars 第 1 版
+
+rc1t 是 1030 研发环境 `deliverable_v2` 的冻结候选，不是 rc1 的移植。它组合 rc3 的上下文参照计数与 rc4 的窄门控，
+去掉全部 logprob 特征后重新训练。本仓只适配输入与加载方式，没有重训或调整阈值；配置与三个静态表的 SHA-256 见 MANIFEST。
+
+- **在线输入只有原始 token id**。但静态表仍包含 dev 训练的 50 棵、最大深度 8 的树，以及 dev 官方负例的 `u/cp/cn`
+  参照计数，因此不是免训练或纯 tokenizer 方案。DSV4 没有参照训练数据，这三项为中性零值，但学习打分仍会运行。
+- **规则**：拦截档为 `bad_utf8` 或 `gb>3.25 & letter`；监控档包含拦截档，并增加两条 `caseless_after_latin` 规则和
+  `gb>1.50 & letter`。GB 有 15 个无 logprob 输入，只在 `fs<0.05` 或 `bad_utf8` 时计算；报警同样晚 1 个 token。
+
+离线 API 不传 logprob：
+
+```python
+from v35_detector import RareDetector, CONFIG_RC1T
+rare = RareDetector('qwen3', CONFIG_RC1T)
+st = rare.start()
+res = rare.feed(st, ids)                 # 任意分块；token-only 配置拒绝 logprob 参数
+res = res or rare.finish(st)
+mon = rare.monitor(st)
+```
+
+在线时用 `V35_RARE=shadow V35_RARE_CONFIG=rc1t`，默认配置仍为 rc3：
+
+```bash
+V35_RARE=shadow V35_RARE_CONFIG=rc1t V35_DETECTOR_TABLE=qwen3 \
+  V35_DETECTOR_EVENTS=/var/log/v35-events.jsonl vllm serve ...
+```
+
+- `collect` 模式不适用于 rc1t；`V35_RARE_TRACE` 也因没有 logprob 而被拒绝。`V35_DETECTOR_RUNNER=sync` 时直接在
+  API server 的输出处理循环里算，`async` 时只把 token id 和空 logprob 占位传给检测进程；m4 的原始 token 流与
+  64-token 分块不变。采样器在该配置下不创建 Collector，vLLM 的 5 文件、35 行补丁不用增加。
+- 服务仍然**只监控、不拦截**：strict / monitor 两档只写 `rare_alert`。没有 `v35_rare` 是正常输入，不会记
+  `no_values`；所有 token 都交给检测器时为 `checked`。rc1t 与 m4 的状态、原因和监控结果独立。
+- **当前 dev（Qwen3 v3.5.8、GLM v35_5，whole）**：Qwen3 拦截档 core 81/115、bonus 535/1748、负例 0/15269，
+  监控档 core 103/115、bonus 927/1748、负例 13/15269；GLM 分别为 core 9/20、17/20，负例 1/1947、4/1947。
+  这里的“拦截档”是评测档位名称，线上不会结束请求。
+- **一致性**：`python tools/verify_against_research.py --research <研究仓路径> --detector rc1t` 在全部 19,321 条 dev 上
+  得到严格档 690 次、监控档 1,167 次报警，与研究仓逐条 0 差异。
+- **资源**（Mac、同进程、256 条 dev、单线程、64-token chunk、3 轮取最好）：rc1t 0.31 μs/token；m4+rc1t 实际配对
+  2.97，m4g+rc1t 3.68。10,240 token 后 rc1t 状态 1,218 B，m4+rc1t 165,554 B，m4g+rc1t 197,398 B；静态表及缓存
+  另计，Qwen3 / GLM 约 41.7 / 42.6 MB。H20 在线 TPOT、CPU 和内存尚未实测。
+- **验证边界**：1030 的 labels_v3_3 heldout 已消费，不能当作未触碰验证，也不能与上述 v3.5.8 dev 直接比较。
+  源 heldout 的 lang_mix bonus 报警为拦截 152/375、监控 251/375，正常多语言混合是否允许触发需先评估。
+  DSV4 的中性参照值不等于完成效果验证，本仓没有新的 DSV4 召回或误报结论。

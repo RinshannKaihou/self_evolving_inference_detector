@@ -1,5 +1,5 @@
-"""Streaming rare_chars detector (DESIGN.md §17): token-level rules on the token id, the top-1 logprob and the generated token's
-logprob (what vLLM returns with logprobs=1); no top-20.
+"""Streaming rare_chars detector (DESIGN.md §17): rc1-rc4 use token ids, the top-1 logprob and the generated token's logprob
+(what vLLM returns with logprobs=1); rc1t uses generated token ids alone. No config uses top-20.
 
     from v35_detector import RareDetector, CONFIG_RC3
     det = RareDetector('qwen3', CONFIG_RC3)                 # table name or a .npz built by rare_vocab.py; config: dict or JSON path
@@ -36,15 +36,17 @@ rc4 (runs/explore/rc4_report.md) adds two config keys, both optional (absent = r
   "ref": "cats"  no reference count tables: only the character categories of each token's first / last character (pcat, ncat),
                  built from the tokenizer at load, so they exist for every corpus (DeepSeek included); needs "gate": "fs", a model
                  without u / cp / cn inputs and no rule on u / jp / jn / cp / cn
+rc1t sets "input": "token_ids" and "ref": "ctx". Its frozen ctx table supplies tokenizer features, a dev-trained 15-input GB
+without logprobs, and dev-negative reference counts. feed(st, ids) rejects logprob arguments; DeepSeek gets neutral reference
+values and still evaluates the GB.
 A config using any of u ... gb sees each token's right neighbour: it runs one token behind the stream, and every one of its
 alerts (any rule) is raised when the token after the triggering one arrives (fired_at = position + 2), or at the end of the
-stream for the last token (fired_at = n). A corpus without a reference table (DeepSeek: no dev data) gets neutral values and
-gb never fires.
+stream for the last token (fired_at = n). For rc3, a corpus without a reference table gets neutral values and gb never fires.
 A rule is a conjunction of atoms; a record fires at the first token satisfying a rule (fired_at = tokens consumed). Rules with
 "tier": "monitor" only record the monitoring tier's first alert; the monitoring tier includes every rule.
 Bounded state: per-class letter counts (token classes and emitted classes), the last 64 letter classes, the previous token's last
-character kind, the UTF-8 decoder's pending bytes (<= 3); rc3 adds the last decided token's id and the held-back token (id and
-two logprobs).
+character kind, the UTF-8 decoder's pending bytes (<= 3), the last decided token id and one held-back token (with logprobs only
+for rc1-rc4).
 """
 import codecs
 import json
@@ -70,6 +72,7 @@ LAZY = ('fsw', 'fse', 'u', 'jp', 'jn', 'cp', 'cn', 'gb')
 REF = ('u', 'jp', 'jn', 'cp', 'cn')
 GB_INPUTS = ['lp1', 'lpc', 'gap', 'cls', 'pcls', 'ncls', 'first', 'last', 'lead', 'pcat', 'ncat', 'fs', 'fsw', 'answer', 'bad_utf8',
              'u', 'cp', 'cn']
+GB_INPUTS_TOKEN_ONLY = [k for k in GB_INPUTS if k not in ('lp1', 'lpc', 'gap')]
 GB_CAT = ['cls', 'pcls', 'ncls', 'first', 'last', 'pcat', 'ncat']   # categorical inputs (integer codes; -1 -> 31)
 GB_GATE = {'fs': 0.05, 'c': rare_ref.GATE_C}         # gb is scored where fs < 0.05 (a letter of a minority class), bad_utf8,
                                                       # cp < -2.5 or cn < -2.5
@@ -132,12 +135,12 @@ def holds(rule, F, memo=None):
     return ok
 
 
-def describe(rule):
+def describe(rule, token_only=False):
     def one(a):
         if 'lt' in a:
             return f"{a['f']}<{a['lt']}"
         if 'gt' in a:
-            return f"{a['f']}>{a['gt']}"
+            return f"{a['f']}>{a['gt']:.2f}" if token_only and a['f'] == 'gb' else f"{a['f']}>{a['gt']}"
         if 'in' in a:
             return f"{a['f']}:{'|'.join(a['in'])}"
         return a['f']
@@ -344,47 +347,61 @@ def _tokf(T, ref):
 
 
 def gb_inputs(F, idx, quant=0.0, fsw=True):
-    """GB_INPUTS at positions idx (float64 [len(idx), len(GB_INPUTS)]; categorical codes -1 -> 31); quant > 0 rounds lp1, lpc and
-    gap to that step (log10), so the trees cannot split on tiny logprob differences; fsw=False leaves that (costlier) column 1"""
+    """Model inputs at positions idx, with no logprob columns when F has none; categorical codes -1 -> 31. quant > 0 rounds
+    lp1, lpc and gap when present; fsw=False leaves that (costlier) column 1."""
     tok, prv, nxt, T, ref = F['_ctx']
     tf = _tokf(T, ref)
+    has_lp = 'lp1' in F
+    inputs, gbi = (GB_INPUTS, _GBI) if has_lp else (GB_INPUTS_TOKEN_ONLY, _GBI_TOKEN)
     if len(idx) == 1:                                    # one position (the common case online): scalar reads
         i = int(idx[0])
         t, pc, nc = int(tok[i]), int(F['pcat'][i]), int(F['ncat'][i])
-        l1, lc = float(F['lp1'][i]), float(F['lpc'][i])
-        x = np.empty((1, len(GB_INPUTS)))
+        x = np.empty((1, len(inputs)))
         r = x[0]
-        r[_GBI['tokf']] = tf[t]
-        r[_GBI['pcls']], r[_GBI['ncls']] = tf[int(prv[i]), 0], tf[int(nxt[i]), 0]
-        r[_GBI['pcat']], r[_GBI['ncat']] = pc, nc
-        r[_GBI['cp']], r[_GBI['cn']] = (ref['cp'][t, pc], ref['cn'][t, nc]) if 'cp' in ref else (0.0, 0.0)
-        p3 = np.array((l1, lc, l1 - lc))
-        r[_GBI['prob']] = np.round(p3 / quant) * quant if quant else p3
-        r[_GBI['fs']], r[_GBI['answer']], r[_GBI['bad_utf8']] = F['fs'][i], F['answer'][i], F['bad_utf8'][i]
-        r[_GBI['fsw']] = F['fsw'].values(idx)[0] if fsw else 1.0
+        r[gbi['tokf']] = tf[t]
+        r[gbi['pcls']], r[gbi['ncls']] = tf[int(prv[i]), 0], tf[int(nxt[i]), 0]
+        r[gbi['pcat']], r[gbi['ncat']] = pc, nc
+        r[gbi['cp']], r[gbi['cn']] = (ref['cp'][t, pc], ref['cn'][t, nc]) if 'cp' in ref else (0.0, 0.0)
+        if has_lp:
+            l1, lc = float(F['lp1'][i]), float(F['lpc'][i])
+            p3 = np.array((l1, lc, l1 - lc))
+            r[gbi['prob']] = np.round(p3 / quant) * quant if quant else p3
+        r[gbi['fs']], r[gbi['answer']], r[gbi['bad_utf8']] = F['fs'][i], F['answer'][i], F['bad_utf8'][i]
+        r[gbi['fsw']] = F['fsw'].values(idx)[0] if fsw else 1.0
         return x
     t = tok[idx]
-    X = np.empty((len(idx), len(GB_INPUTS)))
-    X[:, _GBI['tokf']] = tf[t]
-    X[:, _GBI['pcls']] = tf[prv[idx], 0]
-    X[:, _GBI['ncls']] = tf[nxt[idx], 0]
+    X = np.empty((len(idx), len(inputs)))
+    X[:, gbi['tokf']] = tf[t]
+    X[:, gbi['pcls']] = tf[prv[idx], 0]
+    X[:, gbi['ncls']] = tf[nxt[idx], 0]
     pc, nc = F['pcat'][idx], F['ncat'][idx]
-    X[:, _GBI['pcat']], X[:, _GBI['ncat']] = pc, nc
-    X[:, _GBI['cp']], X[:, _GBI['cn']] = (ref['cp'][t, pc], ref['cn'][t, nc]) if 'cp' in ref else (0.0, 0.0)
-    l1, lc = F['lp1'][idx], F['lpc'][idx]
-    P = np.column_stack((l1, lc, l1 - lc))
-    X[:, _GBI['prob']] = np.round(P / quant) * quant if quant else P
-    X[:, _GBI['fs']] = F['fs'][idx]
-    X[:, _GBI['fsw']] = F['fsw'].values(idx) if fsw else 1.0
-    X[:, _GBI['answer']] = F['answer'][idx]
-    X[:, _GBI['bad_utf8']] = F['bad_utf8'][idx]
+    X[:, gbi['pcat']], X[:, gbi['ncat']] = pc, nc
+    X[:, gbi['cp']], X[:, gbi['cn']] = (ref['cp'][t, pc], ref['cn'][t, nc]) if 'cp' in ref else (0.0, 0.0)
+    if has_lp:
+        l1, lc = F['lp1'][idx], F['lpc'][idx]
+        P = np.column_stack((l1, lc, l1 - lc))
+        X[:, gbi['prob']] = np.round(P / quant) * quant if quant else P
+    X[:, gbi['fs']] = F['fs'][idx]
+    X[:, gbi['fsw']] = F['fsw'].values(idx) if fsw else 1.0
+    X[:, gbi['answer']] = F['answer'][idx]
+    X[:, gbi['bad_utf8']] = F['bad_utf8'][idx]
     return X
 
 
-_GBI = {k: GB_INPUTS.index(k) for k in GB_INPUTS}
-_GBI.update(tokf=[GB_INPUTS.index(k) for k in _TOKF], prob=[GB_INPUTS.index(k) for k in ('lp1', 'lpc', 'gap')])
+def _gb_layout(inputs):
+    out = {k: inputs.index(k) for k in inputs}
+    out['tokf'] = [inputs.index(k) for k in _TOKF]
+    if 'lp1' in inputs:
+        out['prob'] = [inputs.index(k) for k in ('lp1', 'lpc', 'gap')]
+    return out
+
+
+_GBI = _gb_layout(GB_INPUTS)
+_GBI_TOKEN = _gb_layout(GB_INPUTS_TOKEN_ONLY)
 assert set(GB_INPUTS) == set(_TOKF) | {'pcls', 'ncls', 'pcat', 'ncat', 'cp', 'cn', 'lp1', 'lpc', 'gap', 'fs', 'fsw', 'answer',
                                       'bad_utf8'}
+assert GB_INPUTS_TOKEN_ONLY == ['cls', 'pcls', 'ncls', 'first', 'last', 'lead', 'pcat', 'ncat', 'fs', 'fsw', 'answer', 'bad_utf8',
+                                'u', 'cp', 'cn']
 
 
 def features(tok, top1_lp, chosen_lp, T, think_end, state=None, need=(), nxt=None, ref=None, gbm=None, prv=None):
@@ -416,18 +433,25 @@ def features(tok, top1_lp, chosen_lp, T, think_end, state=None, need=(), nxt=Non
         answer[:] = True
         state['answer'] = True
     ecls = cls.astype(np.int64) if 'ecls' in need else None
-    F = {'lp1': np.asarray(top1_lp, np.float64) / LN10, 'lpc': np.asarray(chosen_lp, np.float64) / LN10, 'fs': fs, 'cls': cls,
+    F = {'fs': fs, 'cls': cls, 'letter': isl,
          'bad_utf8': _bad_utf8(state['dec'], tok, T, ecls),
          'caseless_after_latin': (first == 5) & ~lead & let,
          'letter_after_digit': (((first == 1) | (first == 2)) & ~lead & (prev_last == 3)) if 'ref' not in need or 'lad' in need
                                else None,
          'answer': answer}
+    if (top1_lp is None) != (chosen_lp is None):
+        raise ValueError('top1_lp and chosen_lp must be supplied together')
+    if top1_lp is not None:
+        F['lp1'] = np.asarray(top1_lp, np.float64) / LN10
+        F['lpc'] = np.asarray(chosen_lp, np.float64) / LN10
     if 'fsw' in need:
         F['fsw'] = _window_share(cls, isl, state)
     if ecls is not None:
         F['ecls'] = ecls
         F['fse'] = _emitted_share(ecls, state)
     if 'gap' in need:
+        if 'lp1' not in F:
+            raise ValueError('gap needs logprob inputs')
         F['gap'] = F['lp1'] - F['lpc']
     if 'nospace' in need:
         F['nospace'] = ~lead
@@ -486,52 +510,88 @@ class RareDetector:
             raise ValueError(f"think_end='auto' needs a shipped table ({sorted(THINK_END)}); pass the '</think>' id or None")
         self.think_end = THINK_END[corpus] if think_end == 'auto' else think_end
         self.cfg = json.load(open(config)) if isinstance(config, str) else config
+        self.input = self.cfg.get('input', 'token_ids_logprobs')
+        if self.input not in ('token_ids', 'token_ids_logprobs'):
+            raise ValueError('unknown "input"')
+        self.token_only = self.input == 'token_ids'
         self.rules = self.cfg['rules']
+        if self.token_only and any(a['f'] in ('lp1', 'lpc', 'gap') for r in self.rules for a in r['and']):
+            raise ValueError('a token-only config cannot use lp1 / lpc / gap')
         self.need = needs(self.rules)
         self.compiled = [compile_rule(r) for r in self.rules]
         self.strict = [r.get('tier', 'intercept') != 'monitor' for r in self.rules]
         self.has_gb = [any(a['f'] == 'gb' for a in r['and']) for r in self.rules]
         self.look = 'ref' in self.need                   # context features: one token behind the stream
         self.gate = self.cfg.get('gate', 'full')
-        cats = self.cfg.get('ref') == 'cats'
-        if self.gate not in ('full', 'fs') or self.cfg.get('ref', 'counts') not in ('counts', 'cats'):
+        ref_kind = self.cfg.get('ref', 'counts')
+        cats, ctx = ref_kind == 'cats', ref_kind == 'ctx'
+        if self.gate not in ('full', 'fs') or ref_kind not in ('counts', 'cats', 'ctx'):
             raise ValueError('unknown "gate" / "ref"')
         if cats and (self.gate != 'fs' or any(a['f'] in REF for r in self.rules for a in r['and'])):
             raise ValueError('"ref": "cats" needs "gate": "fs" and no rule on a reference feature')
-        self.ref = (rare_ref.load_cats(corpus) if cats else rare_ref.load(corpus)) if self.look else None
-        uses_gb = any(a['f'] == 'gb' for r in self.rules for a in r['and'])
-        if uses_gb and 'gb' not in self.cfg:
+        if ctx and (not self.token_only or self.gate != 'fs' or 'ctx' not in self.cfg):
+            raise ValueError('"ref": "ctx" needs token_ids input, "gate": "fs" and a "ctx" table')
+        self.ctx_path = _repo_path(self.cfg['ctx'].format(corpus=corpus)) if ctx else None
+        if not self.look:
+            self.ref = None
+        elif ctx:
+            self.ref = rare_ref.load_ctx(corpus, self.ctx_path, self.T, self.think_end)
+        else:
+            self.ref = rare_ref.load_cats(corpus) if cats else rare_ref.load(corpus)
+        uses_gb = any(self.has_gb)
+        if uses_gb and not ctx and 'gb' not in self.cfg:
             raise ValueError('a rule uses gb but the config names no model ("gb": path)')
-        self.gbm = GB.load(_repo_path(self.cfg['gb'])) if uses_gb and self.ref is not None else None
-        if self.gbm is not None:                         # the model's inputs, a subset of GB_INPUTS in any order
+        if uses_gb and self.ref is not None:
+            self.gbm = GB.load(self.ctx_path, prefix='gb_') if ctx else GB.load(_repo_path(self.cfg['gb']))
+        else:
+            self.gbm = None
+        if self.gbm is not None:                         # the model's inputs, a subset of the active input layout
             if cats and set(self.gbm.inputs) & {'u', 'cp', 'cn'}:
                 raise ValueError('"ref": "cats": the learned score must not use u / cp / cn')
-            cols = [GB_INPUTS.index(k) for k in self.gbm.inputs]
-            self.gbm.cols = None if cols == list(range(len(GB_INPUTS))) else np.array(cols)
+            if self.token_only and set(self.gbm.inputs) & {'lp1', 'lpc', 'gap'}:
+                raise ValueError('a token-only model cannot use lp1 / lpc / gap')
+            inputs = GB_INPUTS_TOKEN_ONLY if self.token_only else GB_INPUTS
+            cols = [inputs.index(k) for k in self.gbm.inputs]
+            self.gbm.cols = None if cols == list(range(len(inputs))) else np.array(cols)
             self.gbm.uses_fsw = 'fsw' in self.gbm.inputs
             self.gbm.gate = self.gate
 
     def start(self):
         return _StCtx(self.need) if self.look else _St(self.need)
 
-    def feed(self, st, tokens, top1_lp, chosen_lp):
+    def feed(self, st, tokens, top1_lp=None, chosen_lp=None):
+        if self.token_only:
+            if top1_lp is not None or chosen_lp is not None:
+                raise ValueError('token-only feed accepts token ids only')
+        elif top1_lp is None or chosen_lp is None:
+            raise ValueError('this config needs top1_lp and chosen_lp')
         if st.done or not len(tokens):
             return st.result
         if not self.look:
             self._step(st, tokens, top1_lp, chosen_lp, None, None, 0)
             return st.result
         n = len(tokens)
-        bt, b1, bc = np.empty(n + 2, np.int64), np.empty(n + 1), np.empty(n + 1)   # [previous, held, chunk...]
+        bt = np.empty(n + 2, np.int64)                   # [previous, held, chunk...]
+        if self.token_only:
+            b1 = bc = None
+        else:
+            b1, bc = np.empty(n + 1), np.empty(n + 1)
         h = 0 if st.hold is None else 1                  # first chunk: nothing held yet
         bt[0] = st.prev
         if h:
-            bt[1], b1[0], bc[0] = st.hold
-        bt[1 + h:1 + h + n], b1[h:h + n], bc[h:h + n] = tokens, top1_lp, chosen_lp
+            if self.token_only:
+                bt[1] = st.hold
+            else:
+                bt[1], b1[0], bc[0] = st.hold
+        bt[1 + h:1 + h + n] = tokens
+        if not self.token_only:
+            b1[h:h + n], bc[h:h + n] = top1_lp, chosen_lp
         m = n + h                                        # tokens in the buffer after `previous`
-        st.hold = (int(bt[m]), float(b1[m - 1]), float(bc[m - 1]))
+        st.hold = int(bt[m]) if self.token_only else (int(bt[m]), float(b1[m - 1]), float(bc[m - 1]))
         if m > 1:                                        # decide bt[1:m]: previous tokens bt[0:m-1], next tokens bt[2:m+1]
             st.prev = int(bt[m - 1])
-            self._step(st, bt[1:m], b1[:m - 1], bc[:m - 1], bt[:m - 1], bt[2:m + 1], 1)
+            self._step(st, bt[1:m], None if self.token_only else b1[:m - 1], None if self.token_only else bc[:m - 1],
+                       bt[:m - 1], bt[2:m + 1], 1)
         return st.result
 
     def _step(self, st, tokens, top1_lp, chosen_lp, prv, nxt, lag):
@@ -550,20 +610,23 @@ class RareDetector:
             j = min(first.values())
             if st.monitor is None:
                 i = min(k for k, v in first.items() if v == j)          # ties go to the earlier rule
-                st.monitor = Result(True, st.t + j + 1 + lag, describe(self.rules[i]))
+                st.monitor = Result(True, st.t + j + 1 + lag, describe(self.rules[i], self.token_only))
             strict = {k: v for k, v in first.items() if self.strict[k]}
             if strict:
                 j = min(strict.values())
                 i = min(k for k, v in strict.items() if v == j)
-                st.result = Result(True, st.t + j + 1 + lag, describe(self.rules[i]))
+                st.result = Result(True, st.t + j + 1 + lag, describe(self.rules[i], self.token_only))
                 st.done = True
         st.t += len(tokens)
 
     def finish(self, st):
         if self.look and not st.done and st.hold is not None:   # the last token: decided at the end of the stream
             h, st.hold = st.hold, None
-            self._step(st, np.array([h[0]], np.int64), np.array([h[1]]), np.array([h[2]]), np.array([st.prev], np.int64),
-                       np.array([-1], np.int64), 0)
+            if self.token_only:
+                self._step(st, np.array([h], np.int64), None, None, np.array([st.prev], np.int64), np.array([-1], np.int64), 0)
+            else:
+                self._step(st, np.array([h[0]], np.int64), np.array([h[1]]), np.array([h[2]]), np.array([st.prev], np.int64),
+                           np.array([-1], np.int64), 0)
         st.done = True
         return st.result if st.result is not None else Result()
 
@@ -572,8 +635,13 @@ class RareDetector:
         return st.monitor if st.monitor is not None else Result()
 
 
-def record_features(det, tok, top1_lp, chosen_lp, ref='auto'):
+def record_features(det, tok, top1_lp=None, chosen_lp=None, ref='auto'):
     """whole-record features as the detector computes them (ref: override the reference tables, e.g. cross-fitted ones)"""
+    if det.token_only:
+        if top1_lp is not None or chosen_lp is not None:
+            raise ValueError('token-only features accept token ids only')
+    elif top1_lp is None or chosen_lp is None:
+        raise ValueError('this config needs top1_lp and chosen_lp')
     tok = np.asarray(tok, np.int64)
     ctx = {'prv': np.r_[-1, tok[:-1]], 'nxt': np.r_[tok[1:], -1]} if det.look else {}
     return features(tok, top1_lp, chosen_lp, det.T, det.think_end, need=det.need, ref=det.ref if ref == 'auto' else ref,
@@ -593,5 +661,5 @@ def decide(tok, top1_lp, chosen_lp, corpus, config, think_end='auto', tier='inte
         h = np.flatnonzero(holds(r, F))
         if len(h) and (pos is None or h[0] < pos):
             pos = int(h[0])
-            best = (min(pos + 2, n) if det.look else pos + 1, describe(r))
+            best = (min(pos + 2, n) if det.look else pos + 1, describe(r, det.token_only))
     return best

@@ -11,10 +11,9 @@ rc3 and rc4 (garbled-output monitor) get the same token streams with synthetic l
 word sequences put far more tokens through the learned score's gate than real outputs do (rare_gb_gate_share here, about 1%
 on real outputs), so its per-token figure overstates the real cost (research repo, real dev records: 0.76 us/token on an
 Apple M3 Pro). 'hooks' times the whole sync path of serving/hooks.py per token (buffering, 64-token blocks, events) for m4,
-rc3 and both, driven by 1-token engine steps carrying rc3's two values as the patched engine sends them (r3:
-EngineCoreOutput.v35_rare, [top1, chosen]), as the patched OutputProcessor calls it, on loop-free streams with greedy values
-so that both detectors run to the end of every request (hooks_alerts counts the exceptions). rc3_collect is V35_RARE=collect:
-the hook only receives the values (the frontend share of the collect_only profile).
+rc3 / rc4 and rc1t, driven by 1-token engine steps. rc3 / rc4 carry EngineCoreOutput.v35_rare ([top1, chosen]); rc1t carries no
+values and disables sampler collection. The streams are loop-free with greedy values so detectors run to the end of every request
+(hooks_alerts counts exceptions). rc3_collect is V35_RARE=collect for logprob configs: the hook only receives the values.
 
   python bench/cpu_bench.py [--table qwen3] [--rounds 3] [--vllm] [--out runs/cpu_bench.json]
 """
@@ -35,9 +34,9 @@ from synth import KINDS, make  # noqa: E402
 from test_state import state_bytes  # noqa: E402
 from test_rare import synth as rare_synth  # noqa: E402
 from test_vllm_rule import upstream  # noqa: E402
-from v35_detector import CONFIG_M4, CONFIG_RC3, CONFIG_RC4, RareDetector, RepDetector  # noqa: E402
+from v35_detector import CONFIG_M4, CONFIG_RC1T, CONFIG_RC3, CONFIG_RC4, RareDetector, RepDetector  # noqa: E402
 
-RARE_CFG = {'rc3': CONFIG_RC3, 'rc4': CONFIG_RC4}
+RARE_CFG = {'rc3': CONFIG_RC3, 'rc4': CONFIG_RC4, 'rc1t': CONFIG_RC1T}
 from v35_detector import rare as R  # noqa: E402
 from v35_detector.serving import hooks  # noqa: E402
 
@@ -57,7 +56,8 @@ def run_rare(det, tok, lp1, lpc):
     st = det.start()
     fed = 0
     for i in range(0, len(tok), 64):
-        res = det.feed(st, tok[i:i + 64], lp1[i:i + 64], lpc[i:i + 64])
+        ch = tok[i:i + 64]
+        res = det.feed(st, ch) if det.token_only else det.feed(st, ch, lp1[i:i + 64], lpc[i:i + 64])
         fed = min(i + 64, len(tok))
         if res is not None:
             break
@@ -77,16 +77,20 @@ STATIC = '''
 import json, os, sys, tracemalloc
 sys.path.insert(0, sys.argv[1])
 import numpy as np
-from v35_detector import CONFIG_RC3, CONFIG_RC4, RareDetector
+from v35_detector import CONFIG_RC1T, CONFIG_RC3, CONFIG_RC4, RareDetector
 try:
     import psutil
     m0 = psutil.Process().memory_info().rss
 except ImportError:
     psutil = None
 tracemalloc.start()
-det = RareDetector(sys.argv[2], {'rc3': CONFIG_RC3, 'rc4': CONFIG_RC4}[sys.argv[3]])
+det = RareDetector(sys.argv[2], {'rc3': CONFIG_RC3, 'rc4': CONFIG_RC4, 'rc1t': CONFIG_RC1T}[sys.argv[3]])
 st, n = det.start(), 2000
-det.feed(st, np.random.default_rng(0).integers(0, 150000, n), np.full(n, -0.1), np.full(n, -0.5))
+tok = np.random.default_rng(0).integers(0, 150000, n)
+if det.token_only:
+    det.feed(st, tok)
+else:
+    det.feed(st, tok, np.full(n, -0.1), np.full(n, -0.5))
 det.finish(st)
 kept, peak = tracemalloc.get_traced_memory()
 print(json.dumps([kept, peak, None if psutil is None else psutil.Process().memory_info().rss - m0]))
@@ -103,10 +107,9 @@ def static_memory(table, name):
 
 
 def bench_rare(table, streams, rounds, name='rc3'):
-    """per-token cost on the synthetic streams and static memory of one rare_chars configuration; keys rare_* for rc3 (as
-    before), rc4_* for rc4"""
+    """per-token cost and static memory of one rare_chars configuration; keys rare_* for rc3, other names as prefixes"""
     rng = np.random.default_rng(0)
-    data = [(tok, *synthetic_logprobs(len(tok), rng)) for _, tok in streams]
+    data = [(tok, None, None) if name == 'rc1t' else (tok, *synthetic_logprobs(len(tok), rng)) for _, tok in streams]
     kept, peak, grown = static_memory(table, name)
     det = RareDetector(table, RARE_CFG[name])
     run_rare(det, *data[0])                              # first use builds the per-token input table
@@ -158,9 +161,10 @@ def bench_hooks(table, rounds, seeds=4):
                                         ('rc3', 'off', 'shadow', True), ('rc3_buffering_only', 'off', 'shadow', True),
                                         ('m4_rc3', 'shadow', 'shadow', True),
                                         ('m4_rc3_no_values', 'shadow', 'shadow', False),
-                                        ('rc4', 'off', 'shadow', True), ('m4_rc4', 'shadow', 'shadow', True)):
+                                        ('rc4', 'off', 'shadow', True), ('m4_rc4', 'shadow', 'shadow', True),
+                                        ('rc1t', 'off', 'shadow', False), ('m4_rc1t', 'shadow', 'shadow', False)):
             svc = hooks.Service(hooks.settings({'V35_DETECTOR': m4, 'V35_RARE': rare, 'V35_DETECTOR_TABLE': table,
-                                                'V35_RARE_CONFIG': 'rc4' if 'rc4' in name else 'rc3',
+                                                'V35_RARE_CONFIG': 'rc1t' if 'rc1t' in name else 'rc4' if 'rc4' in name else 'rc3',
                                                 'V35_DETECTOR_EVENTS': os.path.join(tmp, name + '.jsonl')}))
             if name == 'rc3_buffering_only':             # the hook's own work: the detector is replaced by a no-op
                 svc.register('-')
@@ -224,6 +228,7 @@ def main():
                load_avg_1m=os.getloadavg()[0] if hasattr(os, 'getloadavg') else None)
     out.update(bench_rare(a.table, streams, a.rounds))
     out.update(bench_rare(a.table, streams, a.rounds, 'rc4'))
+    out.update(bench_rare(a.table, streams, a.rounds, 'rc1t'))
     out.update(bench_hooks(a.table, a.rounds))
     if a.vllm:
         try:                                             # the installed vLLM's own function, as its scheduler calls it

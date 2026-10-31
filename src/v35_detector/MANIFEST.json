@@ -1,9 +1,9 @@
 {
  "source": {
   "repo": "detector_v35",
-  "commit": "eec84190279ce706efd335d39ba698f64af5866c",
+  "commit": "9d972bec76da2af8e2cd3553dfa713f04914b2ab",
   "dir": "detector/",
-  "note": "rare_chars rc3 (rare*.py, configs/rc3.json, tables/*_rare.npz, *_rcref.npz, rc3_gb.npz) was copied from the research working tree before it was committed; these are the files frozen by sha256 for rc3's one-shot holdout / external run (research runs/holdout_ledger.jsonl, 2026-10-22). rc4 (configs/rc4.json, tables/rc4_gb.npz, the gate / ref keys in rare.py and load_cats in rare_ref.py) is research commit 5118334, dev only."
+  "note": "rare_chars rc3 (rare*.py, configs/rc3.json, tables/*_rare.npz, *_rcref.npz, rc3_gb.npz) was copied from the research working tree before it was committed; these are the files frozen by sha256 for rc3's one-shot holdout / external run (research runs/holdout_ledger.jsonl, 2026-10-22). rc4 (configs/rc4.json, tables/rc4_gb.npz, the gate / ref keys in rare.py and load_cats in rare_ref.py) is research commit 5118334, dev only. rc1t (configs/rc1t.json and tables/rc1t_ctx_*.npz) is the frozen token-only candidate in vllm_stability_monitor_evolution_aro_1030/deliverable_v2 (detector be54a279dd83fe38999cfb63d052a153ae7916a89027b618d43921c97559205f), not a release described by the research commit above; its online input and model contain no logprobs, while its static tables retain dev-trained state."
  },
  "sha256": {
   "configs/m4.json": "0f8011c9debe8f57512306f11600dfb14cbc99e457c2810840ee54047f3755f2",
@@ -19,16 +19,20 @@
   "tables/rc3_gb.npz": "ef0965e5621db3431033f1a588ccb364be8fe8ede1e2a50105ab69007fc29f33",
   "configs/rc4.json": "ab97debe5c8afd7466555bbdf630a101a0e88ca463262bc250b4a4bbf8b33da2",
   "tables/rc4_gb.npz": "a8a3e40fe7ba9764292c71c9099cab207f488741ad226ce30864a3408f7af018",
+  "configs/rc1t.json": "03d8200b6460763495e7d24735023173ab0a64506c7b0ad10d67ec86aac25bcb",
+  "tables/rc1t_ctx_qwen3.npz": "61e89cb04d1968f4cbd8be1d36e36cea2800909772ffbcbe5b64f83099e7832c",
+  "tables/rc1t_ctx_glm.npz": "eb07023e0f59dc86bbe74d96145f839b596cdf3804606a0ffe90a03e7ae86cce",
+  "tables/rc1t_ctx_dsv4.npz": "26d8d293b4fd2f7a696e66b045db5e65994ed4f7a68fcf37838561be93599ef0",
   "core.py": "b92107a837a7f6f9b1c0b6633bdeae2e069caff58d9386858271417007a32cd8",
   "offline.py": "e734f0f1d5c77cc2f624f86bb032efda4a76364038437232b12a0651fa8a5cf7",
   "trees.py": "382732196d2059a9c15b0a174101c0210a010a40cd1cae0a9997c12b62e1761a",
-  "rare_gb.py": "d1d82e88451c2dfacfd71d9ca68b5593e5d6acd24f3187d90ba2c1b720fee840"
+  "rare_gb.py": "06e599d5b024df56c1d2a15d6e983f2bc8a3b9a0e0c1c077d88d5e53cbcadfb0"
  },
  "edited": {
   "stream.py": "module docstring; RepDetector.__init__ accepts a .npz table path (think_end must then be given)",
   "vocab.py": "tokenizer paths from the command line instead of the research repo; load() accepts a .npz path",
-  "rare.py": "module docstring example; the config's model path ('detector/tables/<file>') resolves to the package's tables/; RareDetector.__init__ accepts a .npz table path (think_end must then be given)",
+  "rare.py": "module docstring example; config model / ctx paths resolve to the package's tables/ by basename; RareDetector.__init__ accepts a .npz table path (think_end must then be given)",
   "rare_vocab.py": "relative imports; tokenizer path from the command line; load() accepts a .npz path",
-  "rare_ref.py": "relative imports; the table builder (needs labelled research data) removed, loading unchanged (load_cats for rc4 copied as is)"
+  "rare_ref.py": "relative imports; the table builder (needs labelled research data) removed; load_cats for rc4 and load_ctx for rc1t are retained"
  }
 }

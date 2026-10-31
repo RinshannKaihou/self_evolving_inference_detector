@@ -1,9 +1,9 @@
 """Detector process of the async runner (hooks.py, V35_DETECTOR_RUNNER=async): the output-processing loop only queues
-64-token blocks; this process scores them and sends back alerts. It runs m4 (config is None when V35_DETECTOR=off) and rc3
-(rare_config is None when V35_RARE=off) side by side.
+64-token blocks; this process scores them and sends back alerts. It runs m4 (config is None when V35_DETECTOR=off) and the
+selected rare_chars config (rare_config is None when V35_RARE=off) side by side. rc1t messages carry None for both logprob arrays.
 
 Input messages:  m4   ('start', rid) | ('feed', rid, block) | ('finish', rid, rest) | ('drop', rid)
-                 rc3  ('rstart', rid) | ('rfeed', rid, ids, top1_logprobs, chosen_logprobs) | ('rfinish', rid, ids, top1, chosen)
+                 rare ('rstart', rid) | ('rfeed', rid, ids, top1_logprobs, chosen_logprobs) | ('rfinish', rid, ids, top1, chosen)
                       | ('rdrop', rid)
                  ('stop',)
 Output messages: ('ready',) | ('alert', rid, fired_at, reason) | ('final', rid, fired_at, reason)  [an alert on the last
@@ -21,9 +21,9 @@ RARE_OPS = ('rstart', 'rfeed', 'rfinish', 'rdrop')
 
 
 def rare_step(rare, ent, ids, top1, chosen, last):
-    """feed one block of a request to rc3 (and end its stream if last); returns the new alerts as (tier, fired_at, reason),
-    tier 'monitor' (the monitoring tier's first alert) or 'strict' (the strict tier's, which ends rc3 for the request: then
-    ent[0].done). ent = [rc3 state, monitoring-tier alert already reported]"""
+    """feed one block of a request to rare_chars (and end its stream if last); returns new alerts as (tier, fired_at, reason),
+    tier 'monitor' (the monitoring tier's first alert) or 'strict' (the strict tier's, which ends rare_chars for the request:
+    then ent[0].done). ent = [rare state, monitoring-tier alert already reported]; rc1t gets None for both logprob arrays"""
     st = ent[0]
     if len(ids):
         rare.feed(st, ids, top1, chosen)

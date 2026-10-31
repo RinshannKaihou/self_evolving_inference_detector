@@ -153,13 +153,14 @@ def test_settings_are_checked_at_start_up(tmp_path):
 
 # ------------------------------------------------------------------ rc3 (V35_RARE=shadow | collect): monitor only
 from test_rare import _pool, synth as rare_synth  # noqa: E402
-from v35_detector import CONFIG_RC3, CONFIG_RC4  # noqa: E402
+from v35_detector import CONFIG_RC1T, CONFIG_RC3, CONFIG_RC4  # noqa: E402
 from v35_detector import rare as R  # noqa: E402
 from v35_detector.rare_vocab import load as load_rare  # noqa: E402
 
 RC3 = json.load(open(CONFIG_RC3))
 RC4 = json.load(open(CONFIG_RC4))
-RARE_CFG = {'rc3': RC3, 'rc4': RC4}
+RC1T = json.load(open(CONFIG_RC1T))
+RARE_CFG = {'rc3': RC3, 'rc4': RC4, 'rc1t': RC1T}
 
 
 def values(top1, chosen):
@@ -212,16 +213,19 @@ def rare_alerts(ev, rid):
     return {e['tier']: (e['fired_at'], e['reason']) for e in ev if e['event'] == 'rare_alert' and e['request_id'] == rid}
 
 
-@pytest.mark.parametrize('runner,config', [('sync', 'rc3'), ('async', 'rc3'), ('sync', 'rc4'), ('async', 'rc4')])
+@pytest.mark.parametrize('runner,config', [('sync', 'rc3'), ('async', 'rc3'), ('sync', 'rc4'), ('async', 'rc4'),
+                                          ('sync', 'rc1t'), ('async', 'rc1t')])
 def test_rare_shadow_equals_offline_and_never_stops(tmp_path, runner, config):
-    """V35_RARE_CONFIG picks the configuration; the online alerts equal the offline reference of that configuration"""
+    """V35_RARE_CONFIG picks the configuration; rc1t needs no values, and online alerts equal the offline reference"""
     svc = rare_service(tmp_path, runner=runner, config=config)
     want, rng = {}, np.random.default_rng(11)
     for seed in range(6):
         tok, lp1, lpc = rare_stream('qwen3', seed)
-        seen, stop = drive(svc, f'r{seed}', tok, lp1, lpc, rng, sleep=0.0001 if runner == 'async' else 0.0)
-        assert stop is None and seen == len(tok)         # rc3 never ends a request
-        want[f'r{seed}'] = {t: R.decide(tok, lp1, lpc, 'qwen3', RARE_CFG[config], tier=tier)
+        seen, stop = drive(svc, f'r{seed}', tok, lp1, lpc, rng, with_values=config != 'rc1t',
+                           sleep=0.0001 if runner == 'async' else 0.0)
+        assert stop is None and seen == len(tok)         # rare_chars never ends a request
+        l1, lc = (None, None) if config == 'rc1t' else (lp1, lpc)
+        want[f'r{seed}'] = {t: R.decide(tok, l1, lc, 'qwen3', RARE_CFG[config], tier=tier)
                             for t, tier in (('strict', 'intercept'), ('monitor', 'monitor'))}
     svc.close()
     ev = events(svc)
@@ -394,3 +398,10 @@ def test_rare_settings(tmp_path):
     assert s['rare_name'] == 'rc4' and s['rare_config'] == CONFIG_RC4
     with pytest.raises(ValueError):
         hooks.settings({'V35_RARE': 'shadow', 'V35_RARE_CONFIG': 'rc5', 'V35_DETECTOR_TABLE': 'qwen3'})
+    s = hooks.settings({'V35_RARE': 'shadow', 'V35_RARE_CONFIG': 'rc1t', 'V35_DETECTOR_TABLE': 'qwen3'})
+    assert s['rare_name'] == 'rc1t' and s['rare_config'] == CONFIG_RC1T and s['rare_token_only']
+    with pytest.raises(ValueError):
+        hooks.settings({'V35_RARE': 'collect', 'V35_RARE_CONFIG': 'rc1t', 'V35_DETECTOR_TABLE': 'qwen3'})
+    with pytest.raises(ValueError):
+        hooks.settings({'V35_RARE': 'shadow', 'V35_RARE_CONFIG': 'rc1t', 'V35_DETECTOR_TABLE': 'qwen3',
+                        'V35_RARE_TRACE': '64'})

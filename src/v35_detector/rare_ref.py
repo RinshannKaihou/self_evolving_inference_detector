@@ -141,3 +141,30 @@ def load_cats(corpus):
         _CATS[corpus] = {'fcat': fcat, 'lcat': lcat, 'lcat_s': np.r_[lcat, 0].astype(np.int64),
                          'fcat_s': np.r_[fcat, 0].astype(np.int64)}
     return _CATS[corpus]
+
+
+_CTX = {}
+
+
+def load_ctx(corpus, path, T, think_end):
+    """Frozen tokenizer/context tables for token-only configs; absent reference counts mean neutral zeros, not a disabled GB."""
+    key = corpus, os.path.abspath(path), think_end
+    if key not in _CTX:
+        with np.load(path) as z:
+            V = len(T['rcls'])
+            if len(z['rcls']) != V:
+                raise ValueError(f'{path}: vocabulary does not match {corpus}')
+            for k in ('rcls', 'first', 'last', 'lead', 'u8', 'boff', 'bflat'):
+                if not np.array_equal(z[k], T[k]):
+                    raise ValueError(f'{path}: {k} does not match {corpus}')
+            te = int(z['think_end']) if 'think_end' in z else -1
+            chat = bool(z['chat']) if 'chat' in z else False
+            if chat != (think_end is None) or (not chat and te != think_end):
+                raise ValueError(f'{path}: think/chat boundary does not match {corpus}')
+            fcat, lcat = z['fcat'].astype(np.int64), z['lcat'].astype(np.int64)
+            zero = np.zeros(V, np.float32)
+            zeros = np.zeros((V, K), np.float32)
+            _CTX[key] = {'fcat': fcat, 'lcat': lcat, 'lcat_s': np.r_[lcat, 0], 'fcat_s': np.r_[fcat, 0],
+                         'u': z['u'] if 'u' in z else zero, 'cp': z['cp'] if 'cp' in z else zeros,
+                         'cn': z['cn'] if 'cn' in z else zeros}
+    return _CTX[key]

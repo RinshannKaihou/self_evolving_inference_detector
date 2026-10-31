@@ -95,9 +95,9 @@ class GB:
         return self.base + leaves.sum(1)                 # same summation order as the one-row path (row sums)
 
     @classmethod
-    def load(cls, path):
-        z = np.load(path)
-        return cls({k: z[k] for k in z.files})
+    def load(cls, path, prefix=''):
+        with np.load(path) as z:
+            return cls({k[len(prefix):]: z[k] for k in z.files if k.startswith(prefix)})
 
 
 def export(model, depth, inputs, quant=0.0):

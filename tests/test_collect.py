@@ -103,8 +103,19 @@ def test_failures_are_fail_open():
 def test_v35_rare_decides_whether_the_sampler_collects(mode, on):
     env = {} if mode is None else {'V35_RARE': mode}
     code = 'from v35_detector.serving import collect; print(collect.SAMPLER is not None)'
-    full = {k: v for k, v in os.environ.items() if k != 'V35_RARE'}
+    full = {k: v for k, v in os.environ.items() if k not in ('V35_RARE', 'V35_RARE_CONFIG')}
     full.update(env)
+    full['PYTHONPATH'] = os.pathsep.join([os.path.join(os.path.dirname(__file__), '..', 'src'), full.get('PYTHONPATH', '')])
+    r = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, env=full)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == str(on)
+
+
+@pytest.mark.parametrize('mode,config,on', [('shadow', 'rc1t', False), ('shadow', 'rc4', True), ('collect', 'rc1t', False)])
+def test_token_only_config_disables_sampler_collection(mode, config, on):
+    code = 'from v35_detector.serving import collect; print(collect.SAMPLER is not None)'
+    full = {k: v for k, v in os.environ.items() if k not in ('V35_RARE', 'V35_RARE_CONFIG')}
+    full.update(V35_RARE=mode, V35_RARE_CONFIG=config)
     full['PYTHONPATH'] = os.pathsep.join([os.path.join(os.path.dirname(__file__), '..', 'src'), full.get('PYTHONPATH', '')])
     r = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, env=full)
     assert r.returncode == 0, r.stderr

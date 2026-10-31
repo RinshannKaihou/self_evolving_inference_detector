@@ -4,9 +4,9 @@ research repo's tools/run_detector.py) over the research repo's dev records and 
 the research repo's saved runs. Needs the research repo and its corpora; dev only (holdout / external are guarded there).
 Exit status 1 on any difference.
   m4  (repetition):  runs/m4_dev_fires.jsonl
-  rc3 / rc4 (rare_chars):  runs/<rc>_dev_fires.jsonl (strict tier) and runs/<rc>_monitor_dev_fires.jsonl (monitoring tier), with the same
-                     logprob inputs as run_detector.py (the generated token's logprob; where the data lacks it, the 20th logprob)
-  python3 tools/verify_against_research.py --research /Volumes/T7/work/inference_severe_error_monitor/detector_v35 [--detector rc3|rc4]
+  rc3 / rc4 / rc1t (rare_chars): runs/<rc>_dev_fires.jsonl and runs/<rc>_monitor_dev_fires.jsonl. rc3 / rc4 use the same
+                     logprob inputs as run_detector.py (the generated token's logprob; where absent, the 20th); rc1t uses token ids only
+  python3 tools/verify_against_research.py --research /Volumes/T7/work/inference_severe_error_monitor/detector_v35 [--detector rc3|rc4|rc1t]
 """
 import argparse
 import json
@@ -19,9 +19,9 @@ import numpy as np
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, 'src'))
-from v35_detector import CONFIG_M4, CONFIG_RC3, CONFIG_RC4, RareDetector, RepDetector  # noqa: E402
+from v35_detector import CONFIG_M4, CONFIG_RC1T, CONFIG_RC3, CONFIG_RC4, RareDetector, RepDetector  # noqa: E402
 
-RARE = {'rc3': CONFIG_RC3, 'rc4': CONFIG_RC4}
+RARE = {'rc3': CONFIG_RC3, 'rc4': CONFIG_RC4, 'rc1t': CONFIG_RC1T}
 
 _D = {}
 
@@ -49,7 +49,8 @@ def _run_rare(a):
     st = det.start()
     res = None
     for i in range(0, len(tok), 64):
-        res = det.feed(st, tok[i:i + 64], lp1[i:i + 64], lpc[i:i + 64])
+        ch = tok[i:i + 64]
+        res = det.feed(st, ch) if det.token_only else det.feed(st, ch, lp1[i:i + 64], lpc[i:i + 64])
         if res is not None:
             break
     res = res or det.finish(st)
@@ -60,7 +61,7 @@ def _run_rare(a):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--research', required=True)
-    ap.add_argument('--detector', default='m4', choices=('m4', 'rc3', 'rc4'))
+    ap.add_argument('--detector', default='m4', choices=('m4', 'rc3', 'rc4', 'rc1t'))
     ap.add_argument('--procs', type=int, default=9)
     ap.add_argument('--out', default=None)
     a = ap.parse_args()
@@ -80,8 +81,10 @@ def main():
         fn, items = _run_m4, ((r.key, r.corpus, np.asarray(r.token_ids)) for r in iter_records('dev'))
     else:
         fn = _run_rare
-        items = ((a.detector, r.key, r.corpus, np.asarray(r.token_ids), r.top_lps[:, 0],
-                  np.where(np.isnan(r.chosen_lp), r.top_lps[:, -1], r.chosen_lp)) for r in iter_records('dev'))
+        needs_lp = a.detector in ('rc3', 'rc4')
+        items = ((a.detector, r.key, r.corpus, np.asarray(r.token_ids), r.top_lps[:, 0] if needs_lp else None,
+                  np.where(np.isnan(r.chosen_lp), r.top_lps[:, -1], r.chosen_lp) if needs_lp else None)
+                 for r in iter_records('dev'))
     got, diff = {t: {} for t in stems}, []
     with Pool(a.procs) as p:
         for key, res in p.imap_unordered(fn, items, chunksize=16):

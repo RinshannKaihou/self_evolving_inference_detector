@@ -1,0 +1,16 @@
+{
+ "name": "rc1t",
+ "label": "rare_chars",
+ "input": "token_ids",
+ "note": "Token-only rare_chars detector, version 1. Online input is generated token ids only. The frozen per-corpus tables contain tokenizer features, a dev-trained 50-tree score and dev-negative reference counts; this is not a tokenizer-only or training-free detector. Ported without retuning from vllm_stability_monitor_evolution_aro_1030/deliverable_v2 (FROZEN_V2.json). One token look-ahead; intercept and monitor tiers are computed in one pass.",
+ "ctx": "detector/tables/rc1t_ctx_{corpus}.npz",
+ "gate": "fs",
+ "ref": "ctx",
+ "rules": [
+  {"and": [{"f": "bad_utf8"}]},
+  {"and": [{"f": "gb", "gt": 3.25}, {"f": "letter"}]},
+  {"and": [{"f": "fs", "lt": 0.01}, {"f": "fsw", "lt": 0.05}, {"f": "caseless_after_latin"}], "tier": "monitor"},
+  {"and": [{"f": "fs", "lt": 0.01}, {"f": "answer"}, {"f": "caseless_after_latin"}], "tier": "monitor"},
+  {"and": [{"f": "gb", "gt": 1.5}, {"f": "letter"}], "tier": "monitor"}
+ ]
+}

@@ -15,15 +15,16 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PKG = os.path.join(REPO, 'src', 'v35_detector')
 SHIPPED = ['configs/m4.json', 'tables/qwen3.npz', 'tables/glm.npz', 'tables/dsv4.npz',
            'configs/rc3.json', 'tables/qwen3_rare.npz', 'tables/glm_rare.npz', 'tables/dsv4_rare.npz', 'tables/qwen3_rcref.npz',
-           'tables/glm_rcref.npz', 'tables/rc3_gb.npz', 'configs/rc4.json', 'tables/rc4_gb.npz']
+           'tables/glm_rcref.npz', 'tables/rc3_gb.npz', 'configs/rc4.json', 'tables/rc4_gb.npz',
+           'configs/rc1t.json', 'tables/rc1t_ctx_qwen3.npz', 'tables/rc1t_ctx_glm.npz', 'tables/rc1t_ctx_dsv4.npz']
 LOGIC = ['core.py', 'offline.py', 'trees.py', 'rare_gb.py']   # byte copies of the research repo's detector/
 EDITED = {'stream.py': 'module docstring; RepDetector.__init__ accepts a .npz table path (think_end must then be given)',
           'vocab.py': 'tokenizer paths from the command line instead of the research repo; load() accepts a .npz path',
-          'rare.py': "module docstring example; the config's model path ('detector/tables/<file>') resolves to the package's tables/; "
-                     "RareDetector.__init__ accepts a .npz table path (think_end must then be given)",
+          'rare.py': "module docs and package table paths; rc1t token-only feed/state, 15-input GB mapping, frozen ctx loading, "
+                     "and reason formatting; custom .npz table paths for non-ctx configurations",
           'rare_vocab.py': 'relative imports; tokenizer path from the command line; load() accepts a .npz path',
-          'rare_ref.py': 'relative imports; the table builder (needs labelled research data) removed, loading unchanged '
-                         '(load_cats for rc4 copied as is)'}
+          'rare_ref.py': 'relative imports; the table builder (needs labelled research data) removed; load_cats for rc4; '
+                         'new load_ctx adapter validates rc1t tokenizer/boundary and supplies neutral references without counts'}
 
 
 def sha(path):
@@ -45,7 +46,12 @@ def main():
     note = ('rare_chars rc3 (rare*.py, configs/rc3.json, tables/*_rare.npz, *_rcref.npz, rc3_gb.npz) was copied from the research '
             "working tree before it was committed; these are the files frozen by sha256 for rc3's one-shot holdout / external run "
             '(research runs/holdout_ledger.jsonl, 2026-10-22). rc4 (configs/rc4.json, tables/rc4_gb.npz, the gate / ref keys in rare.py '
-            'and load_cats in rare_ref.py) is research commit 5118334, dev only.')
+            'and load_cats in rare_ref.py) is research commit 5118334, dev only. rc1t (configs/rc1t.json and '
+            'tables/rc1t_ctx_*.npz) is the frozen token-only candidate in vllm_stability_monitor_evolution_aro_1030/deliverable_v2 '
+            '(detector be54a279dd83fe38999cfb63d052a153ae7916a89027b618d43921c97559205f), not a release described by the '
+            'research commit above; its online input and model contain no logprobs, while its static tables retain dev-trained state. '
+            'The reference alerts in detector_v35/runs/rc1t_* came from that repo\'s uncommitted rc1t adapter working tree, '
+            'not from the research commit above; the frozen 1030 detector and table hashes are the provenance anchor.')
     out = {'source': {'repo': 'detector_v35', 'commit': commit, 'dir': 'detector/', 'note': note},
            'sha256': files, 'edited': EDITED}
     with open(os.path.join(PKG, 'MANIFEST.json'), 'w') as f:

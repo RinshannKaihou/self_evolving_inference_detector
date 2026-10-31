@@ -25,8 +25,8 @@ fault inside a kernel cannot be caught; every load and store is masked to the te
 collected in r3: the rejection sampler's bonus-token call (predict_bonus_token=True) is skipped, so requests under MTP get
 values only for steps without drafts (rc3 reports them as 'lost').
 
-V35_RARE is read at import: off (default) -> SAMPLER is None and the patched sampler does nothing else (no GPU work);
-collect | shadow -> SAMPLER is a Collector.
+V35_RARE and V35_RARE_CONFIG are read at import: off (default) or rc1t -> SAMPLER is None and the patched sampler does no
+collection; collect | shadow with a logprob config (rc3 / rc4) -> SAMPLER is a Collector.
 """
 import logging
 import os
@@ -168,4 +168,5 @@ class Collector:
 
 
 MODE = os.environ.get('V35_RARE', 'off')
-SAMPLER = Collector() if MODE in ('collect', 'shadow') else None
+CONFIG = os.environ.get('V35_RARE_CONFIG', 'rc3')
+SAMPLER = Collector() if MODE in ('collect', 'shadow') and CONFIG != 'rc1t' else None

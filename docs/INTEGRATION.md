@@ -1,4 +1,4 @@
-# 适配流程：把 m4 接入 vLLM 0.27（以及乱码监控 rc3 的在线接入，§10）
+# 适配流程：把 m4 接入 vLLM 0.27（以及 rare_chars 的在线接入，§10）
 
 ## 1. 接入位置
 
@@ -390,11 +390,35 @@ r4 要回答：rc4 在线的开销是否不高于 rc3（预期更低：学习打
 - 报警：rc4 的三个检测组都对同一个压测请求（固定 seed，第 915 个 token）报了严格档（`gb>2.07 & gap<0.3`），rc3 对它只报监控档；
   输出原文没有保存，不能判断真假。
 
-### 10.6 新模型
+### 10.6 rc1t：不经过采样器的 token-only 接入（0.5.0）
+
+rc1t（接口说明 §9.9）只读原始输出 token id，适合与 m4 一样在 API server 检测，不需要 rc3/rc4 的 raw-logits
+采集、GPU Triton 核或 logprob 传输：
+
+```bash
+V35_DETECTOR=intercept V35_DETECTOR_RUNNER=sync \
+V35_RARE=shadow V35_RARE_CONFIG=rc1t V35_DETECTOR_TABLE=qwen3 \
+V35_DETECTOR_EVENTS=/var/log/v35-events.jsonl vllm serve ...
+```
+
+- `sync` 在输出处理循环里与 m4 并行消费同一 token 流；`async` 也可把同一流送入独立检测进程。选择哪种方式取决于
+  CPU 隔离和部署约束，rc1t 本身不要求 worker。m4 的 64-token 分块不变，rc1t 的向量化、一个 token 前瞻独立维护。
+- Qwen3 / GLM 的 `V35_DETECTOR_THINK_END` 必须与冻结表一致（`auto` 或显式同值 id），DSV4 使用 `none`（chat）。
+  sync / async 都在配置阶段校验，不允许把不匹配的边界延迟到首个请求时才暴露。
+- `V35_RARE=collect` 和 `V35_RARE_TRACE` 不适用于 rc1t；选择 rc1t 时采样器不创建 Collector，前端收到
+  `v35_rare=None` 是正常情况，请求覆盖仍应为 `checked`。rare_chars 只监控，m4 是否拦截由 `V35_DETECTOR` 决定。
+- DSV4 保留冻结方案的中性零参照并继续运行 GB，但偏差方向和效果未验证；`rare_alert` 的 `ref: neutral` 用于单独
+  统计，不应直接沿用 Qwen3 / GLM 的召回或误报预期。
+- 上线顺序仍是先 `shadow` 观察，再按需打开 m4 的 `intercept`。尤其先检查正常多语言混合：源 labels_v3_3
+  heldout 的 lang_mix bonus 有较高报警比例，不能把它等同于普通负例误报，也不能忽略实际拦截策略的影响。
+- 本仓已完成原始冻结实现金标、合成流、sync/async 服务与全部 19,321 条 dev 的逐条等价验证；Mac 离线组合开销见
+  接口说明 §9.9。**H20 在线 TPOT、CPU 和内存未测，DSV4 效果未测**，不能把 rc4 的 H20 结果直接套到 rc1t。
+
+### 10.7 新模型
 
 - 建 rare 词表（`python -m v35_detector.rare_vocab`）；
-- 学习打分依赖用该模型带标签的正常输出统计的参照表，没有参照表时它不触发，只剩机制规则（DeepSeek 就是这种情况）。
-  在线钩子目前只接受内置词表名，新模型要先把它的表加进包里。
+- rc3 的学习打分依赖用该模型带标签的正常输出统计的参照表，没有参照表时它不触发，只剩机制规则；rc4 不查参照表，
+  rc1t 在没有参照训练数据时使用中性零值但仍运行 GB。在线钩子目前只接受内置词表名，新模型要先把它的表加进包里。
 
 **上线前要看的**：
 - 学习打分的提升是针对注入故障学到的，换一种故障或模型，召回预期回到前一版 rc2 的水平；

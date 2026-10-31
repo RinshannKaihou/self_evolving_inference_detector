@@ -1,18 +1,19 @@
-"""rc3 (rare_chars) on synthetic token streams: streaming equals the whole-record reference under any chunking, both tiers;
-planted bad tokens fire the expected rules with the one-token look-ahead; a vocabulary without a reference table never uses the
-learned score; the per-request state is bounded. tools/verify_against_research.py checks the evaluated dev alerts instead."""
+"""rare_chars on synthetic token streams: streaming equals the whole-record reference under any chunking, both tiers;
+planted bad tokens fire the expected rules with the one-token look-ahead; per-request state is bounded. rc1t also has frozen
+GB/alert golden fixtures; tools/verify_against_research.py checks all evaluated dev alerts against the external research repo."""
 import json
 import sys
 
 import numpy as np
 import pytest
 
-from v35_detector import CONFIG_RC3, RareDetector
+from v35_detector import CONFIG_RC1T, CONFIG_RC3, RareDetector
 from v35_detector.rare import decide
 from v35_detector.rare_vocab import CI, load as load_rare
 from v35_detector.vocab import THINK_END
 
 RC3 = json.load(open(CONFIG_RC3))
+RC1T = json.load(open(CONFIG_RC1T))
 LN10 = np.log(10)
 
 
@@ -41,7 +42,9 @@ def stream(det, tok, lp1, lpc, rng):
     i = 0
     while i < len(tok):
         k = int(rng.choice([1, 5, 64, 100, 333]))
-        if det.feed(st, tok[i:i + k], lp1[i:i + k], lpc[i:i + k]) is not None:
+        ch = tok[i:i + k]
+        res = det.feed(st, ch) if det.token_only else det.feed(st, ch, lp1[i:i + k], lpc[i:i + k])
+        if res is not None:
             break
         i += k
     res = det.finish(st)
@@ -186,3 +189,131 @@ def test_rc4_config_keys_are_checked():
         RareDetector('qwen3', dict(RC4, rules=RC4['rules'] + [{'and': [{'f': 'u', 'lt': -6}]}]))
     rc3 = RareDetector('qwen3', RC3)                     # rc3 (no gate / ref keys): full gate, reference tables
     assert rc3.gate == 'full' and 'u' in rc3.ref and rc3.gbm.gate == 'full'
+
+
+# ------------------------------------------------------------------ rc1t: token ids only
+@pytest.mark.parametrize('corpus', ['qwen3', 'glm', 'dsv4'])
+def test_rc1t_stream_equals_whole_record(corpus):
+    det = RareDetector(corpus, RC1T)
+    assert det.token_only and det.gbm is not None and det.gbm.gate == 'fs'
+    if corpus == 'dsv4':
+        assert not np.any(det.ref['u']) and not np.any(det.ref['cp']) and not np.any(det.ref['cn'])
+    rng = np.random.default_rng(31)
+    T = load_rare(corpus)
+    word = next(int(i) for i in _pool(T, 'latin', True) if T['bytes'][i].decode().strip().isalpha() and len(T['bytes'][i]) > 4)
+    fired = 0
+    for seed in range(8):
+        tok, _, _ = synth(corpus, 1500, seed, han_share=0.05 * (seed % 4))
+        if seed % 2 == 0:
+            tok[700], tok[701] = word, int(_pool(T, 'han', False)[seed])
+        strict, mon = stream(det, tok, None, None, rng)
+        assert strict == decide(tok, None, None, corpus, RC1T), (corpus, seed)
+        assert mon == decide(tok, None, None, corpus, RC1T, tier='monitor'), (corpus, seed)
+        fired += mon[0] >= 0
+    assert fired > 0
+
+
+def test_rc1t_bad_utf8_empty_single_and_last_token():
+    T = load_rare('qwen3')
+    lone = next(i for i, b in enumerate(T['bytes']) if b == b'\x80')
+    space = next(i for i, b in enumerate(T['bytes']) if b == b' ')
+    tok, _, _ = synth('qwen3', 800, 1, han_share=0.0)
+    tok[500] = lone
+    det = RareDetector('qwen3', RC1T)
+    assert decide(tok, None, None, 'qwen3', RC1T) == (502, 'bad_utf8')
+    assert stream(det, tok, None, None, np.random.default_rng(0))[0] == (502, 'bad_utf8')
+    for ids in (np.array([], np.int64), np.array([0]), np.array([lone]), np.array([lone, space])):
+        want = decide(ids, None, None, 'qwen3', RC1T)
+        assert stream(det, ids, None, None, np.random.default_rng(1))[0] == want
+
+
+def test_rc1t_rejects_logprobs_and_bad_configs():
+    det = RareDetector('qwen3', RC1T)
+    with pytest.raises(ValueError):
+        det.feed(det.start(), [0], [0.0], [0.0])
+    with pytest.raises(ValueError):
+        RareDetector('qwen3', dict(RC1T, rules=[{'and': [{'f': 'lp1', 'lt': -1.0}]}]))
+    with pytest.raises(ValueError):
+        RareDetector('qwen3', dict(RC1T, input='token_ids_logprobs'))
+    tok, _, _ = synth('qwen3', 300, 3)
+    from v35_detector import rare as R
+    F = R.record_features(det, tok)
+    assert 'lp1' not in F and 'lpc' not in F and F['gb'].values(np.arange(len(tok))).shape == (len(tok),)
+
+
+def test_rc1t_state_is_bounded():
+    cfg = dict(RC1T, rules=[dict(r, tier='monitor') for r in RC1T['rules']])
+    det = RareDetector('qwen3', cfg)
+    T = load_rare('qwen3')
+    rng = np.random.default_rng(3)
+    st, sizes = det.start(), []
+    for n in (1000, 20000):
+        tok = rng.integers(0, len(T['rcls']), n)
+        det.feed(st, tok)
+        sizes.append(_bytes(st))
+    assert isinstance(st.hold, int) and len(st.f['ring']) <= 64
+    assert sizes[1] <= sizes[0] + 64 and sizes[1] < 16 * 1024
+
+
+def _golden():
+    import os
+    with open(os.path.join(os.path.dirname(__file__), 'fixtures', 'rc1t_golden.json')) as f:
+        return json.load(f)['cases']
+
+
+@pytest.mark.parametrize('case', _golden(), ids=lambda case: case['name'])
+def test_rc1t_matches_frozen_golden(case):
+    """Expected alerts and GB scores come from the original frozen implementation, not this package's decide()."""
+    from v35_detector import rare as R
+    corpus, tok = case['corpus'], np.asarray(case['tokens'], np.int64)
+    det = RareDetector(corpus, RC1T)
+    for tier in ('intercept', 'monitor'):
+        assert decide(tok, None, None, corpus, RC1T, tier=tier) == tuple(case['expected'][tier])
+    assert stream(det, tok, None, None, np.random.default_rng(19)) == \
+        (tuple(case['expected']['intercept']), tuple(case['expected']['monitor']))
+    F = R.record_features(det, tok)
+    for pos, want in case['gb_scores'].items():
+        got = F['gb'].values(np.array([int(pos)]))[0]
+        assert got == pytest.approx(want, abs=1e-9)
+    if corpus == 'dsv4':
+        assert not np.any(det.ref['u']) and not np.any(det.ref['cp']) and not np.any(det.ref['cn'])
+
+
+def test_rc1t_reason_format_matches_frozen():
+    from v35_detector import rare as R
+    assert R.describe(RC1T['rules'][4], token_only=True) == 'gb>1.50 & letter'
+
+
+def test_rc1t_custom_table_is_rejected(tmp_path):
+    import os
+    import shutil
+    from v35_detector.vocab import TABLES
+    path = str(tmp_path / 'custom.npz')
+    shutil.copy(os.path.join(TABLES, 'qwen3_rare.npz'), path)
+    with pytest.raises(ValueError, match='custom .npz tables are not supported'):
+        RareDetector(path, RC1T, think_end=THINK_END['qwen3'])
+
+
+def test_rc1t_ctx_table_mismatches(tmp_path):
+    from v35_detector import rare_ref
+    det = RareDetector('qwen3', RC1T)
+    T = load_rare('qwen3')
+    base = {k: T[k] for k in ('rcls', 'first', 'last', 'lead', 'u8', 'boff', 'bflat')}
+    base.update(fcat=det.ref['fcat'], lcat=det.ref['lcat'], think_end=np.array(THINK_END['qwen3']), chat=np.array(False))
+
+    path = tmp_path / 'vocabulary.npz'
+    np.savez(path, **dict(base, rcls=base['rcls'][:-1]))
+    with pytest.raises(ValueError, match='vocabulary does not match'):
+        rare_ref.load_ctx('qwen3', str(path), T, THINK_END['qwen3'])
+
+    first = base['first'].copy()
+    first[0] += 1
+    path = tmp_path / 'column.npz'
+    np.savez(path, **dict(base, first=first))
+    with pytest.raises(ValueError, match='first does not match'):
+        rare_ref.load_ctx('qwen3', str(path), T, THINK_END['qwen3'])
+
+    path = tmp_path / 'boundary.npz'
+    np.savez(path, **dict(base, think_end=np.array(THINK_END['qwen3'] + 1)))
+    with pytest.raises(ValueError, match='think/chat boundary does not match'):
+        rare_ref.load_ctx('qwen3', str(path), T, THINK_END['qwen3'])

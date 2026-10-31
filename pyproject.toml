@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "v35-detector"
 version = "0.5.0"
-description = "Streaming repetition detector for LLM inference outputs (taxonomy v3.5, configuration m4)"
+description = "Streaming repetition and rare-character detectors for LLM inference outputs (m4, rc3, rc4, rc1t)"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]
 

@@ -405,3 +405,22 @@ def test_rare_settings(tmp_path):
     with pytest.raises(ValueError):
         hooks.settings({'V35_RARE': 'shadow', 'V35_RARE_CONFIG': 'rc1t', 'V35_DETECTOR_TABLE': 'qwen3',
                         'V35_RARE_TRACE': '64'})
+    with pytest.raises(ValueError, match='think/chat boundary'):
+        hooks.settings({'V35_DETECTOR': 'intercept', 'V35_RARE': 'shadow', 'V35_RARE_CONFIG': 'rc1t',
+                        'V35_DETECTOR_TABLE': 'qwen3', 'V35_DETECTOR_THINK_END': 'none', 'V35_DETECTOR_RUNNER': 'async'})
+    s = hooks.settings({'V35_RARE': 'shadow', 'V35_RARE_CONFIG': 'rc1t', 'V35_DETECTOR_TABLE': 'qwen3',
+                        'V35_DETECTOR_THINK_END': str(THINK_END['qwen3']), 'V35_DETECTOR_RUNNER': 'async'})
+    assert s['think_end'] == THINK_END['qwen3']
+    s = hooks.settings({'V35_RARE': 'shadow', 'V35_RARE_CONFIG': 'rc1t', 'V35_DETECTOR_TABLE': 'dsv4',
+                        'V35_DETECTOR_THINK_END': 'none', 'V35_DETECTOR_RUNNER': 'async'})
+    assert s['think_end'] is None
+
+
+def test_rc1t_dsv4_alert_marks_neutral_reference(tmp_path):
+    svc = rare_service(tmp_path, corpus='dsv4', config='rc1t')
+    tok, lp1, lpc = rare_stream('dsv4', 0, 800)
+    drive(svc, 'r1', tok, lp1, lpc, np.random.default_rng(4), with_values=False)
+    svc.close()
+    alert = next(e for e in events(svc) if e['event'] == 'rare_alert')
+    assert alert['reason'] == 'bad_utf8'
+    assert (alert['corpus'], alert['config'], alert['ref']) == ('dsv4', 'rc1t', 'neutral')

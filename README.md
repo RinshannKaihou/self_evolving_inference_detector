@@ -5,19 +5,20 @@
 - **循环输出**（taxonomy v3.5 的 `repetition` core）：检测器 **m4**，命中后可以像 stop string 一样立刻结束请求；
 - **乱码**（`rare_chars` core：一眼可见的生僻字乱码，如英文里的西里尔、泰文碎片、非法 UTF-8；纯 ASCII 的碎片不算 core）：默认检测器 **rc3**，也可选 **rc4** 或 token-only **rc1t**；只监控，报警写进日志，从不结束请求。
 
-判定逻辑、配置与表格是研究仓 `detector_v35` 被评测版本的逐字节拷贝（`src/v35_detector/MANIFEST.json`）。
-`tools/verify_against_research.py` 在全部 19,321 条选型集记录上逐条复现了研究仓的报警。
+检测器的研究来源、冻结哈希和本仓适配改动见 `src/v35_detector/MANIFEST.json`。rc1t 的配置与三张静态表来自 1030 研发环境
+`deliverable_v2`，并非 `detector_v35` 某个发布提交中的文件。`tools/verify_against_research.py` 在全部 19,321 条选型集记录上
+逐条复现研究仓的报警；仓内另有原始冻结实现生成的 GB 分数与报警金标，不依赖外部研究仓即可测试。
 
 ## 两个检测器
 
-| | m4（循环输出） | rc3（乱码监控） |
-|---|---|---|
-| 输入 | 生成的 token id | token id，加每个 token 的 top-1 logprob 与生成 token 的 logprob（模型原始分布） |
-| 判定 | 每 64 个 token 一个检查点，14 个条件，任一条件连续成立即报警 | 逐 token 的规则：严格档 4 条（3 条机制规则、1 条学习打分），监控档再加 2 条；报警比触发的 token 晚 1 个 token |
-| 线上开关 | `V35_DETECTOR=off \| shadow \| intercept`（shadow 只记录，intercept 结束请求） | `V35_RARE=off \| collect \| shadow`（collect 只采集输入，shadow 只记录），没有拦截模式 |
-| 检测效果（研究仓评测，Qwen3 留出集） | 检出率 0.444，误报率 0.062%（上限 0.1%）；vLLM 自带检查调参后 0.317 | 严格档检出率 0.794，误报率 0.213%，**超过 0.1% 的上限**，所以只监控；前一版 rc2 为 0.670（2026-10-22 起的乱码口径） |
-| 每 token CPU | Mac 3.4–3.6 μs；H20 服务器 6.7–14 μs | Mac 0.76 μs；H20 线上 3.7–4.3 μs |
-| 内存 | 每请求最多约 166 KB，不随输出长度增长；词表每进程 2.3 MB | 每请求约 1.3 KB；参照表等每进程约 64 MB |
+| | m4（循环输出） | rc3（乱码监控） | rc1t（token-only 乱码监控） |
+|---|---|---|---|
+| 输入 | 生成的 token id | token id，加每个 token 的 top-1 logprob 与生成 token 的 logprob（模型原始分布） | 只读生成的 token id，不采集 logprob |
+| 判定 | 每 64 个 token 一个检查点，14 个条件，任一条件连续成立即报警 | 逐 token 的规则：严格档 4 条（3 条机制规则、1 条学习打分），监控档再加 2 条；报警比触发的 token 晚 1 个 token | 严格档 2 条，监控档再加 3 条；15 个无 logprob 的 GB 输入，同样晚 1 个 token |
+| 线上开关 | `V35_DETECTOR=off \| shadow \| intercept`（shadow 只记录，intercept 结束请求） | `V35_RARE=off \| collect \| shadow`（collect 只采集输入，shadow 只记录），没有拦截模式 | `V35_RARE=off \| shadow`，只监控；不支持 collect 和 logprob trace |
+| 检测效果 | Qwen3 留出集：检出率 0.444，误报率 0.062%（上限 0.1%）；vLLM 自带检查调参后 0.317 | Qwen3 留出集：严格档检出率 0.794，误报率 0.213%，**超过 0.1% 的上限**，所以只监控；前一版 rc2 为 0.670（2026-10-22 起的乱码口径） | 当前 dev：Qwen3 严格/监控档 core 召回 70.4% / 89.6%，负例误报 0 / 0.085%；与左侧留出集口径不直接比较 |
+| 每 token CPU | Mac 3.4–3.6 μs；H20 服务器 6.7–14 μs | Mac 0.76 μs；H20 线上 3.7–4.3 μs | Mac 真实 dev 0.31 μs；H20 未测 |
+| 内存 | 每请求最多约 166 KB，不随输出长度增长；词表每进程 2.3 MB | 每请求约 1.3 KB；参照表等每进程约 64 MB | 每请求约 1.2 KB；静态表与缓存约 42 MB |
 
 ## 当前状态
 
@@ -37,7 +38,8 @@
   在线只读原始 token id，不创建采样器 logprob Collector，可在 API server（sync）或检测进程（async）运行；35 行 vLLM 补丁不变，
   `collect` 与 logprob trace 不适用于它。token-only 仅指在线输入，静态表仍含 dev 训练的学习打分与 dev 负例参照计数。
   当前 dev 口径下，Qwen3 拦截/监控档 core 召回为 70.4% / 89.6%（负例误报 0 / 0.085%），GLM 为 45.0% / 85.0%
-  （0.051% / 0.205%）；线上只监控、不拦截。Mac 同 session 实测 rc1t 0.31 μs/token，m4+rc1t 2.97，m4g+rc1t 3.68；
+  （0.051% / 0.205%）；线上只监控、不拦截。Mac 真实 dev 同 session 配对实测 rc1t 0.31 μs/token，m4+rc1t 2.97，
+  m4g+rc1t 3.68；发布仓合成流 hook 的保守测量为 rc1t 0.47、m4+rc1t 3.18，两组数字口径不同。
   每请求状态约 1.2 KB，静态表与缓存约 42 MB。全部 19,321 条 dev 的严格档 690 次、监控档 1,167 次报警与研究仓一致。
   **尚未做 H20 在线性能测试或 DSV4 效果评测**；1030 的 labels_v3_3 heldout 已消费，不能当作未触碰验证，lang_mix 高报警是部署边界。
 
@@ -51,6 +53,7 @@
 | `h20-r2` | 0.2.0 | m4，rc3（输入取自请求的 logprobs） | 1 个文件、17 行 | 已测，原始结果在研究仓 `report/data/h20_20261022/` |
 | `h20-r3` | 0.3.0 | m4，rc3（输入在采样器里采集） | 5 个文件、35 行 | 已测，原始结果在研究仓 `report/data/h20_20261022_r3/` |
 | `h20-r4` | 0.4.0 | m4，rc3 与 rc4（`V35_RARE_CONFIG` 切换） | 同 r3 | 已测，原始结果在研究仓 `report/data/h20_20261022_r4/` |
+| 待定 | 0.5.0 | m4、rc3、rc4，新增 token-only rc1t | 同 r3，未增加 | 未测 |
 
 ## 安装
 

@@ -20,11 +20,11 @@ SHIPPED = ['configs/m4.json', 'tables/qwen3.npz', 'tables/glm.npz', 'tables/dsv4
 LOGIC = ['core.py', 'offline.py', 'trees.py', 'rare_gb.py']   # byte copies of the research repo's detector/
 EDITED = {'stream.py': 'module docstring; RepDetector.__init__ accepts a .npz table path (think_end must then be given)',
           'vocab.py': 'tokenizer paths from the command line instead of the research repo; load() accepts a .npz path',
-          'rare.py': "module docstring example; config model / ctx paths resolve to the package's tables/ by basename; "
-                     "RareDetector.__init__ accepts a .npz table path (think_end must then be given)",
+          'rare.py': "module docs and package table paths; rc1t token-only feed/state, 15-input GB mapping, frozen ctx loading, "
+                     "and reason formatting; custom .npz table paths for non-ctx configurations",
           'rare_vocab.py': 'relative imports; tokenizer path from the command line; load() accepts a .npz path',
-          'rare_ref.py': 'relative imports; the table builder (needs labelled research data) removed; load_cats for rc4 and '
-                         'load_ctx for rc1t are retained'}
+          'rare_ref.py': 'relative imports; the table builder (needs labelled research data) removed; load_cats for rc4; '
+                         'new load_ctx adapter validates rc1t tokenizer/boundary and supplies neutral references without counts'}
 
 
 def sha(path):
@@ -49,7 +49,9 @@ def main():
             'and load_cats in rare_ref.py) is research commit 5118334, dev only. rc1t (configs/rc1t.json and '
             'tables/rc1t_ctx_*.npz) is the frozen token-only candidate in vllm_stability_monitor_evolution_aro_1030/deliverable_v2 '
             '(detector be54a279dd83fe38999cfb63d052a153ae7916a89027b618d43921c97559205f), not a release described by the '
-            'research commit above; its online input and model contain no logprobs, while its static tables retain dev-trained state.')
+            'research commit above; its online input and model contain no logprobs, while its static tables retain dev-trained state. '
+            'The reference alerts in detector_v35/runs/rc1t_* came from that repo\'s uncommitted rc1t adapter working tree, '
+            'not from the research commit above; the frozen 1030 detector and table hashes are the provenance anchor.')
     out = {'source': {'repo': 'detector_v35', 'commit': commit, 'dir': 'detector/', 'note': note},
            'sha256': files, 'edited': EDITED}
     with open(os.path.join(PKG, 'MANIFEST.json'), 'w') as f:

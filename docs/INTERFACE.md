@@ -357,3 +357,33 @@ V35_RARE=shadow V35_RARE_CONFIG=rc1t V35_DETECTOR_TABLE=qwen3 \
 - **验证边界**：1030 的 labels_v3_3 heldout 已消费，不能当作未触碰验证，也不能与上述 v3.5.8 dev 直接比较。
   源 heldout 的 lang_mix bonus 报警为拦截 152/375、监控 251/375，正常多语言混合是否允许触发需先评估。
   DSV4 的中性参照值不等于完成效果验证，本仓没有新的 DSV4 召回或误报结论。
+
+### 9.10 RC1T 外部 tokenizer bundle
+
+支持具有 **ByteLevel decoder 的 byte-level BPE** `tokenizer.json`。其他 decoder（包括
+SentencePiece/Metaspace、WordPiece）会在导出时明确拒绝；不支持非特殊 added token 的
+lstrip/rstrip 行为。构表需要安装 `v35-detector[vocab]`，线上仍只需要 numpy。
+
+```bash
+python -m v35_detector.rc1t_vocab --tokenizer /models/custom/tokenizer.json \
+  --think-end none --out /models/custom/rc1t.npz
+```
+
+chat 模型指定 `none`，推理模型显式指定结束思考的 token id。输出包含 tokenizer 特征、
+首末字符类别、冻结 RC1T 的 GB 参数、边界配置和 m4 所需列；不包含正常输出参照统计。
+`u/cp/cn` 因此使用中性零值，GB 继续运行，报警标记 `ref: neutral`。
+这只是无需语料的工程接入，新模型的召回和误报尚需评估。
+
+```python
+rare = RareDetector('/models/custom/rc1t.npz', CONFIG_RC1T, think_end=None)
+# 推理模型的 think_end 需与导出时的整数一致；外部表不接受 auto。
+```
+
+```bash
+V35_RARE=shadow V35_RARE_CONFIG=rc1t \
+V35_DETECTOR_TABLE=/models/custom/rc1t.npz V35_DETECTOR_THINK_END=none \
+V35_DETECTOR_RUNNER=sync vllm serve ...
+```
+
+`async` 同样支持；增加 `V35_DETECTOR=shadow` 可同时开启 m4。外部 bundle 在服务启动时
+校验，缺字段、类别维度不符或 think/chat 边界不符会报错。内置模型继续使用原始冻结表。

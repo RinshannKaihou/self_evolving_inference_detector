@@ -154,6 +154,19 @@ def load_ctx(corpus, path, T, think_end):
             V = len(T['rcls'])
             if len(z['rcls']) != V:
                 raise ValueError(f'{path}: vocabulary does not match {corpus}')
+            for k in ('rcls', 'first', 'last', 'lead', 'u8'):
+                if z[k].shape != (V,):
+                    raise ValueError(f'{path}: invalid {k} shape')
+            for k in ('fcat', 'lcat'):
+                a = z[k]
+                if a.shape != (V,) or a.dtype.kind not in 'iu' or np.any((a < 0) | (a >= K)):
+                    raise ValueError(f'{path}: invalid {k}')
+            present = [k in z for k in ('u', 'cp', 'cn')]
+            if any(present) and not all(present):
+                raise ValueError(f'{path}: u/cp/cn must be supplied together')
+            for k, shape in (('u', (V,)), ('cp', (V, K)), ('cn', (V, K))):
+                if k in z and (z[k].shape != shape or not np.isfinite(z[k]).all()):
+                    raise ValueError(f'{path}: invalid {k}')
             for k in ('rcls', 'first', 'last', 'lead', 'u8', 'boff', 'bflat'):
                 if not np.array_equal(z[k], T[k]):
                     raise ValueError(f'{path}: {k} does not match {corpus}')
@@ -166,5 +179,5 @@ def load_ctx(corpus, path, T, think_end):
             zeros = np.zeros((V, K), np.float32)
             _CTX[key] = {'fcat': fcat, 'lcat': lcat, 'lcat_s': np.r_[lcat, 0], 'fcat_s': np.r_[fcat, 0],
                          'u': z['u'] if 'u' in z else zero, 'cp': z['cp'] if 'cp' in z else zeros,
-                         'cn': z['cn'] if 'cn' in z else zeros}
+                         'cn': z['cn'] if 'cn' in z else zeros, 'neutral': not any(present)}
     return _CTX[key]

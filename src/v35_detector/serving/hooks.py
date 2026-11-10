@@ -21,7 +21,7 @@ Environment, read when this module is imported (a misconfiguration stops the ser
   V35_RARE_CONFIG         rc3 (default) | rc4 | rc1t: which garbled-output configuration shadow runs; rc1t disables collection
   V35_RARE_TRACE          N > 0: log the first N tokens' logprob values ('rare_trace' events; rc3/rc4 only, not rc1t)
   V35_DETECTOR_TABLE      qwen3 | glm | dsv4 | /path/to/table.npz (built by v35_detector.vocab); required when m4 or rare_chars
-                          detects (not for collect alone); rare_chars needs a shipped name (its tables come with it)
+                          detects (not for collect alone); rc1t also accepts an external bundle; rc3/rc4 need shipped names
   V35_DETECTOR_THINK_END  auto (default; shipped tables only) | none (chat mode) | the '</think>' token id
   V35_DETECTOR_RUNNER     sync (default: inside the output-processing loop) | async (a separate detector process); both
                           detectors run in the same place
@@ -96,13 +96,14 @@ def settings(env):
         det = RepDetector(table, s['config'], think_end)     # fails now on a bad table, think_end or config
         s['think_end'] = det.think_end
     if rare == 'shadow':
-        if table not in THINK_END:
+        if table not in THINK_END and not (rare_token_only and table.endswith('.npz')):
             raise ValueError(f'V35_RARE needs a shipped table in V35_DETECTOR_TABLE ({" | ".join(THINK_END)}), got {table!r}: '
                              'rare_chars also needs the model\'s rare and reference tables')
-        if s['think_end'] == 'auto':
+        if s['think_end'] == 'auto' and table in THINK_END:
             s['think_end'] = THINK_END[table]
         if runner == 'sync' or rare_token_only:          # async rc1t must fail before its worker can disable both detectors
-            RareDetector(table, s['rare_config'], s['think_end'])
+            detector = RareDetector(table, s['rare_config'], s['think_end'])
+            s['rare_neutral'] = bool(rare_token_only and detector.ref.get('neutral', False))
     return s
 
 
@@ -357,7 +358,7 @@ class Service:
     def rare_log(self, rid, tier, at, reason, after_end=False):
         self.n['rare_' + tier] += 1
         extra = {'corpus': self.s['table'], 'config': self.s['rare_name']}
-        if self.rare_token_only and self.s['table'] == 'dsv4':
+        if self.rare_token_only and self.s.get('rare_neutral', False):
             extra['ref'] = 'neutral'
         if after_end:
             self.event('rare_alert', request_id=rid, tier=tier, fired_at=at, reason=reason, after_end=True, **extra)

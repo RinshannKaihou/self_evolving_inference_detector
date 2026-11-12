@@ -160,3 +160,9 @@ python tools/verify_against_research.py --research <研究仓 detector_v35 的�
 ```
 
 后三条需要研究仓及其语料，只读选型集。
+
+RC1T 也支持外部 byte-level BPE tokenizer：使用
+`python -m v35_detector.rc1t_vocab --tokenizer /models/custom/tokenizer.json --think-end none --out /models/custom/rc1t.npz`
+构建自包含表，再将 `V35_DETECTOR_TABLE` 设为该文件，并显式设置 `V35_DETECTOR_THINK_END`。
+该方式复用冻结 GB、使用中性零参照；支持 sync/async 与 m4 并用。
+支持格式和效果边界见 [接口说明 §9.10](docs/INTERFACE.md#910-rc1t-外部-tokenizer-bundle)。

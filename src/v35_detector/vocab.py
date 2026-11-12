@@ -54,7 +54,7 @@ def build(tokenizer_json):
     from tokenizers import Tokenizer
     tk = Tokenizer.from_file(tokenizer_json)
     V = tk.get_vocab_size()
-    special = {a['id'] for a in json.load(open(tokenizer_json)).get('added_tokens', []) if a.get('special')}
+    special = {i for i, token in tk.get_added_tokens_decoder().items() if token.special}
     bd = _byte_decoder()
     norm = np.full(V, SEP, np.int32)
     letter = np.zeros(V, bool)

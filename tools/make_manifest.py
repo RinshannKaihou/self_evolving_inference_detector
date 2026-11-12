@@ -21,10 +21,10 @@ LOGIC = ['core.py', 'offline.py', 'trees.py', 'rare_gb.py']   # byte copies of t
 EDITED = {'stream.py': 'module docstring; RepDetector.__init__ accepts a .npz table path (think_end must then be given)',
           'vocab.py': 'tokenizer paths from the command line instead of the research repo; load() accepts a .npz path',
           'rare.py': "module docs and package table paths; rc1t token-only feed/state, 15-input GB mapping, frozen ctx loading, "
-                     "and reason formatting; custom .npz table paths for non-ctx configurations",
+                     "and reason formatting; custom .npz table paths for non-ctx configurations; external RC1T bundles reuse the frozen GB with explicit boundaries",
           'rare_vocab.py': 'relative imports; tokenizer path from the command line; load() accepts a .npz path',
           'rare_ref.py': 'relative imports; the table builder (needs labelled research data) removed; load_cats for rc4; '
-                         'new load_ctx adapter validates rc1t tokenizer/boundary and supplies neutral references without counts'}
+                         'new load_ctx adapter validates rc1t tokenizer/boundary and supplies neutral references without counts; validate context shapes and expose neutral-reference status'}
 
 
 def sha(path):

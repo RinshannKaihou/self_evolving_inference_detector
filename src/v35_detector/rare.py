@@ -2,7 +2,7 @@
 (what vLLM returns with logprobs=1); rc1t uses generated token ids alone. No config uses top-20.
 
     from v35_detector import RareDetector, CONFIG_RC3
-    det = RareDetector('qwen3', CONFIG_RC3)                 # table name / .npz (non-ctx only); rc1t needs a shipped name
+    det = RareDetector('qwen3', CONFIG_RC3)                 # table name / .npz (non-ctx only); rc1t also accepts a self-contained external bundle
     st = det.start()
     for ids, top1_lp, chosen_lp in chunks:                  # natural-log logprobs, any chunk size
         res = det.feed(st, ids, top1_lp, chosen_lp)         # Result once a strict-tier rule fires, else None
@@ -506,11 +506,13 @@ def _repo_path(path):
 
 class RareDetector:
     def __init__(self, corpus, config, think_end='auto'):
+        self.cfg = json.load(open(config)) if isinstance(config, str) else config
+        if self.cfg.get('ref') == 'ctx' and corpus.endswith('.npz'):
+            rare_ref.validate_bundle(corpus)
         self.T = load_rare(corpus)
         if think_end == 'auto' and corpus not in THINK_END:
             raise ValueError(f"think_end='auto' needs a shipped table ({sorted(THINK_END)}); pass the '</think>' id or None")
         self.think_end = THINK_END[corpus] if think_end == 'auto' else think_end
-        self.cfg = json.load(open(config)) if isinstance(config, str) else config
         self.input = self.cfg.get('input', 'token_ids_logprobs')
         if self.input not in ('token_ids', 'token_ids_logprobs'):
             raise ValueError('unknown "input"')
@@ -532,9 +534,8 @@ class RareDetector:
             raise ValueError('"ref": "cats" needs "gate": "fs" and no rule on a reference feature')
         if ctx and (not self.token_only or self.gate != 'fs' or 'ctx' not in self.cfg):
             raise ValueError('"ref": "ctx" needs token_ids input, "gate": "fs" and a "ctx" table')
-        if ctx and corpus not in THINK_END:
-            raise ValueError(f'"ref": "ctx" supports only shipped corpora ({sorted(THINK_END)}); custom .npz tables are not supported')
-        self.ctx_path = _repo_path(self.cfg['ctx'].format(corpus=corpus)) if ctx else None
+        external_ctx = ctx and corpus.endswith('.npz')
+        self.ctx_path = (corpus if external_ctx else _repo_path(self.cfg['ctx'].format(corpus=corpus))) if ctx else None
         if not self.look:
             self.ref = None
         elif ctx:

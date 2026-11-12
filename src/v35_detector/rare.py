@@ -506,11 +506,13 @@ def _repo_path(path):
 
 class RareDetector:
     def __init__(self, corpus, config, think_end='auto'):
+        self.cfg = json.load(open(config)) if isinstance(config, str) else config
+        if self.cfg.get('ref') == 'ctx' and corpus.endswith('.npz'):
+            rare_ref.validate_bundle(corpus)
         self.T = load_rare(corpus)
         if think_end == 'auto' and corpus not in THINK_END:
             raise ValueError(f"think_end='auto' needs a shipped table ({sorted(THINK_END)}); pass the '</think>' id or None")
         self.think_end = THINK_END[corpus] if think_end == 'auto' else think_end
-        self.cfg = json.load(open(config)) if isinstance(config, str) else config
         self.input = self.cfg.get('input', 'token_ids_logprobs')
         if self.input not in ('token_ids', 'token_ids_logprobs'):
             raise ValueError('unknown "input"')

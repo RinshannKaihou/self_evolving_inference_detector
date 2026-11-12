@@ -290,7 +290,7 @@ def test_rc1t_plain_rare_table_is_rejected(tmp_path):
     from v35_detector.vocab import TABLES
     path = str(tmp_path / 'custom.npz')
     shutil.copy(os.path.join(TABLES, 'qwen3_rare.npz'), path)
-    with pytest.raises(KeyError):  # a plain rare table lacks the required ctx and GB fields
+    with pytest.raises(ValueError, match='not an RC1T bundle: missing'):
         RareDetector(path, RC1T, think_end=THINK_END['qwen3'])
 
 

@@ -4,8 +4,10 @@ The frozen GB is reused; absent reference counts select neutral zeros. This
 exports features, not a newly trained or evaluated detector.
 """
 import argparse
+import hashlib
 import json
 import os
+import unicodedata
 
 import numpy as np
 
@@ -14,32 +16,35 @@ from .rare_ref import charcat
 
 
 def build(tokenizer_json, think_end):
-    with open(tokenizer_json) as f:
-        spec = json.load(f)
+    with open(tokenizer_json, 'rb') as f:
+        source = f.read()
+    spec = json.loads(source)
     # Reject other decoder semantics rather than silently treating pieces as bytes.
     if (spec.get('model', {}).get('type') != 'BPE'
             or spec.get('decoder', {}).get('type') != 'ByteLevel'):
         raise ValueError('RC1T export supports BPE with a ByteLevel decoder only')
-    for token in spec.get('added_tokens', []):
-        if not token.get('special') and (token.get('lstrip') or token.get('rstrip')):
-            raise ValueError('added tokens with whitespace stripping are unsupported')
+    from tokenizers import Tokenizer
+    tk = Tokenizer.from_file(tokenizer_json)
+    added = tk.get_added_tokens_decoder()
+    special = {i for i, token in added.items() if token.special}
     tables = rare_vocab.build(tokenizer_json)
-    V = len(tables['rcls'])
+    V = tk.get_vocab_size()
     if think_end is not None and not 0 <= think_end < V:
         raise ValueError('think_end must be a vocabulary token id or None')
     bd = vocab._byte_decoder()
-    special = {a['id'] for a in spec.get('added_tokens', []) if a.get('special')}
-    # Added tokens are literal strings, even when their characters belong to the
-    # GPT-2 byte alphabet. Ordinary vocabulary pieces must use that alphabet.
-    from tokenizers import Tokenizer
-    tk = Tokenizer.from_file(tokenizer_json)
-    added = {a['id']: a['content'] for a in spec.get('added_tokens', [])}
     chunks = []
     for i in range(V):
         piece = tk.id_to_token(i)
         if piece is None:
             raise ValueError(f'vocabulary has a hole at token {i}')
-        b = added[i].encode('utf-8') if i in added else bytes(bd[c] for c in piece)
+        try:
+            # ByteLevel decodes the whole piece only if every character belongs
+            # to its byte alphabet; otherwise added-token text remains literal.
+            b = bytes(bd[c] for c in piece)
+        except KeyError as e:
+            if i not in added:
+                raise ValueError(f'token {i} {piece!r}: outside ByteLevel byte alphabet') from e
+            b = added[i].content.encode('utf-8')
         chunks.append(b)
         s = b.decode('utf-8', 'ignore')
         tables['lead'][i] = b[:1] in (b' ', b'\n', b'\t', b'\r')
@@ -51,6 +56,8 @@ def build(tokenizer_json, think_end):
                   bflat=np.frombuffer(b''.join(chunks), np.uint8),
                   fcat=np.array([charcat(b.decode('utf-8', 'ignore')[:1]) for b in chunks], np.int8),
                   lcat=np.array([charcat(b.decode('utf-8', 'ignore')[-1:]) for b in chunks], np.int8),
+                  tokenizer_sha256=np.array(hashlib.sha256(source).hexdigest()),
+                  vocab_size=np.array(V), unicode_version=np.array(unicodedata.unidata_version),
                   chat=np.array(think_end is None), think_end=np.array(-1 if think_end is None else think_end))
     # Include the existing repetition columns for the shared online table option.
     tables.update(vocab.build(tokenizer_json))

@@ -361,8 +361,8 @@ V35_RARE=shadow V35_RARE_CONFIG=rc1t V35_DETECTOR_TABLE=qwen3 \
 ### 9.10 RC1T 外部 tokenizer bundle
 
 支持具有 **ByteLevel decoder 的 byte-level BPE** `tokenizer.json`。其他 decoder（包括
-SentencePiece/Metaspace、WordPiece）会在导出时明确拒绝；不支持非特殊 added token 的
-lstrip/rstrip 行为。构表需要安装 `v35-detector[vocab]`，线上仍只需要 numpy。
+SentencePiece/Metaspace、WordPiece）会在导出时明确拒绝。added token 使用加载后的实际 id
+和 ByteLevel 解码字节；lstrip/rstrip 仅作用于编码，允许导出。构表需要安装 `v35-detector[vocab]`，线上仍只需要 numpy。
 
 ```bash
 python -m v35_detector.rc1t_vocab --tokenizer /models/custom/tokenizer.json \
@@ -387,3 +387,13 @@ V35_DETECTOR_RUNNER=sync vllm serve ...
 
 `async` 同样支持；增加 `V35_DETECTOR=shadow` 可同时开启 m4。外部 bundle 在服务启动时
 校验，缺字段、类别维度不符或 think/chat 边界不符会报错。内置模型继续使用原始冻结表。
+
+外部 bundle 的字段校验只保证内部结构与边界，不校验它是否匹配正在服务的模型 tokenizer。
+导出文件记录 `tokenizer_sha256`（输入 tokenizer.json 原始字节的 SHA-256）、`vocab_size` 和
+`unicode_version`，部署者应核对来源及词表；重新格式化 JSON 也会改变文件哈希。
+当前钩子不读取 vLLM 实际 tokenizer，不会自动完成该匹配检查。
+只提供 tiktoken 格式的模型需要先转换为兼容的 tokenizer.json。
+
+m4 列沿用原构表语义，部分非特殊 added token 会作为不透明片段处理；RC1T 则使用解码字节。
+因此对新增 token，二者的类别处理不保证相同。导出依赖本机 Unicode 数据版本；版本记录用于
+追溯，不意味着跨 Python/Unicode 版本构表结果必然逐字段一致。冻结内置表保持不变。

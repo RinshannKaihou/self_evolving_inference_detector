@@ -146,11 +146,28 @@ def load_cats(corpus):
 _CTX = {}
 
 
+_CTX_FIELDS = {'rcls', 'first', 'last', 'lead', 'u8', 'boff', 'bflat', 'fcat', 'lcat', 'think_end', 'chat'}
+_GB_FIELDS = {'gb_' + k for k in ('depth', 'feat', 'thr', 'cat', 'mask', 'leaf', 'base', 'inputs', 'quant')}
+
+
+def _require_ctx_fields(z, path, gb=False):
+    missing = (_CTX_FIELDS | (_GB_FIELDS if gb else set())) - set(z.files)
+    if missing:
+        raise ValueError(f'{path}: not an RC1T bundle: missing {", ".join(sorted(missing))}')
+
+
+def validate_bundle(path):
+    """Check external bundle fields before the generic vocabulary loader indexes them."""
+    with np.load(path) as z:
+        _require_ctx_fields(z, path, gb=True)
+
+
 def load_ctx(corpus, path, T, think_end):
     """Frozen tokenizer/context tables for token-only configs; absent reference counts mean neutral zeros, not a disabled GB."""
     key = corpus, os.path.abspath(path), think_end
     if key not in _CTX:
         with np.load(path) as z:
+            _require_ctx_fields(z, path)
             V = len(T['rcls'])
             if len(z['rcls']) != V:
                 raise ValueError(f'{path}: vocabulary does not match {corpus}')
@@ -173,7 +190,9 @@ def load_ctx(corpus, path, T, think_end):
             te = int(z['think_end']) if 'think_end' in z else -1
             chat = bool(z['chat']) if 'chat' in z else False
             if chat != (think_end is None) or (not chat and te != think_end):
-                raise ValueError(f'{path}: think/chat boundary does not match {corpus}')
+                raise ValueError(f'{path}: think/chat boundary does not match: bundle chat={chat}, '
+                                 f'think_end={te}; requested think_end={think_end!r} '
+                                 '(V35_DETECTOR_THINK_END)')
             fcat, lcat = z['fcat'].astype(np.int64), z['lcat'].astype(np.int64)
             zero = np.zeros(V, np.float32)
             zeros = np.zeros((V, K), np.float32)

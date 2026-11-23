@@ -414,11 +414,23 @@ V35_DETECTOR_EVENTS=/var/log/v35-events.jsonl vllm serve ...
 - 本仓已完成原始冻结实现金标、合成流、sync/async 服务与全部 19,321 条 dev 的逐条等价验证；Mac 离线组合开销见
   接口说明 §9.9。**H20 在线 TPOT、CPU 和内存未测，DSV4 效果未测**，不能把 rc4 的 H20 结果直接套到 rc1t。
 
-### 10.7 新模型
+### 10.7 rc2t：跨词表免参照的 token-only 接入（0.6.0）
+
+rc2t（接口说明 §9.11）同样只读原始输出 token id，无需采样器 Collector 与 logprob 传输；与 rc1t 相比去掉了按模型词表统计的参照表，可在 `V35_DETECTOR_TABLE` 中直接传入内置名、`.npz` bundle、`tokenizer.json` 或模型目录：
+
+```bash
+V35_RARE=shadow V35_RARE_CONFIG=rc2t V35_DETECTOR_TABLE=/path/to/model_dir \
+V35_DETECTOR_EVENTS=/var/log/v35-events.jsonl vllm serve ...
+```
+
+- 仅开 rc2t（`V35_DETECTOR=off`）时可直接传 `tokenizer.json` 或模型目录，且 `V35_DETECTOR_THINK_END=auto` 会自动探测 `</think>` 等标记；
+- 若同时开启循环检测（`V35_DETECTOR=shadow|intercept`），需传内置名或通过 `python -m v35_detector.rc2t_vocab --tokenizer <tokenizer.json> --out <bundle>.npz --include-m4` 导出包含 m4 列的 `.npz` bundle。
+
+### 10.8 新模型
 
 - 建 rare 词表（`python -m v35_detector.rare_vocab`）；
 - rc3 的学习打分依赖用该模型带标签的正常输出统计的参照表，没有参照表时它不触发，只剩机制规则；rc4 不查参照表，
-  rc1t 在没有参照训练数据时使用中性零值但仍运行 GB。rc3/rc4 在线钩子仍只接受内置词表名；rc1t 支持下面的外部 bundle。
+  rc1t 在没有参照训练数据时使用中性零值但仍运行 GB；rc2t 使用通用 Unicode 先验，无需目标模型参照语料即可开箱运行。rc3/rc4 在线钩子仍只接受内置词表名；rc1t 支持外部 bundle；rc2t 支持内置名、bundle、tokenizer.json 或模型目录。
 
 **上线前要看的**：
 - 学习打分的提升是针对注入故障学到的，换一种故障或模型，召回预期回到前一版 rc2 的水平；

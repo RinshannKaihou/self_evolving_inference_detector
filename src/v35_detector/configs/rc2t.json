@@ -1,0 +1,16 @@
+{
+ "name": "rc2t",
+ "label": "rare_chars",
+ "input": "token_ids",
+ "note": "Token-only rare_chars detector, version 2 (tokenizer-agnostic). Online input is generated token ids only. Uses a 21-input 65-tree GBDT over universal Unicode character priors (mapped onto any target vocabulary at load time) and stdlib national-charset rarity tiers, removing per-tokenizer corpus count tables. Accepts shipped names, .npz bundles, tokenizer.json paths, model directories, or in-memory Tokenizer instances. One token look-ahead; intercept and monitor tiers are computed in one pass.",
+ "model": "detector/tables/rc2t_model.npz",
+ "gate": "fs",
+ "ref": "uni",
+ "rules": [
+  {"and": [{"f": "bad_utf8"}]},
+  {"and": [{"f": "gb", "gt": 3.85}, {"f": "letter"}]},
+  {"and": [{"f": "fs", "lt": 0.01}, {"f": "fsw", "lt": 0.05}, {"f": "caseless_after_latin"}], "tier": "monitor"},
+  {"and": [{"f": "fs", "lt": 0.01}, {"f": "answer"}, {"f": "caseless_after_latin"}], "tier": "monitor"},
+  {"and": [{"f": "gb", "gt": 2.7}, {"f": "letter"}], "tier": "monitor"}
+ ]
+}

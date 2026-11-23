@@ -17,11 +17,12 @@ Environment, read when this module is imported (a misconfiguration stops the ser
   V35_DETECTOR            off (default) | shadow (detect and log) | intercept (detect, log and stop the request): m4
   V35_RARE                off (default) | collect | shadow: garbled-output monitoring. rc3/rc4 collect two logprobs per token
                           in the sampler; shadow detects and logs and never stops a request; collect only records input coverage.
-                          rc1t consumes token ids directly, needs no sampler values and supports shadow only (not collect)
-  V35_RARE_CONFIG         rc3 (default) | rc4 | rc1t: which garbled-output configuration shadow runs; rc1t disables collection
-  V35_RARE_TRACE          N > 0: log the first N tokens' logprob values ('rare_trace' events; rc3/rc4 only, not rc1t)
+                          rc1t/rc2t consume token ids directly, need no sampler values and support shadow only (not collect)
+  V35_RARE_CONFIG         rc3 (default) | rc4 | rc1t | rc2t: which garbled-output configuration shadow runs; rc1t/rc2t disable collection
+  V35_RARE_TRACE          N > 0: log the first N tokens' logprob values ('rare_trace' events; rc3/rc4 only, not rc1t/rc2t)
   V35_DETECTOR_TABLE      qwen3 | glm | dsv4 | /path/to/table.npz (built by v35_detector.vocab); required when m4 or rare_chars
-                          detects (not for collect alone); rc1t also accepts an external bundle; rc3/rc4 need shipped names
+                          detects (not for collect alone); rc1t also accepts an external bundle; rc2t also accepts tokenizer.json
+                          or a model directory directly; rc3/rc4 need shipped names
   V35_DETECTOR_THINK_END  auto (default; shipped tables only) | none (chat mode) | the '</think>' token id
   V35_DETECTOR_RUNNER     sync (default: inside the output-processing loop) | async (a separate detector process); both
                           detectors run in the same place
@@ -45,7 +46,7 @@ from collections import Counter
 
 import numpy as np
 
-from .. import CONFIG_M4, CONFIG_RC1T, CONFIG_RC3, CONFIG_RC4
+from .. import CONFIG_M4, CONFIG_RC1T, CONFIG_RC2T, CONFIG_RC3, CONFIG_RC4
 from ..core import BLOCK
 from ..rare import RareDetector
 from ..stream import RepDetector
@@ -54,7 +55,7 @@ from .worker import rare_step, worker_main
 
 MODES = ('off', 'shadow', 'intercept')
 RARE_MODES = ('off', 'collect', 'shadow')                # rare_chars monitors only: there is no intercept mode
-RARE_CONFIGS = {'rc3': CONFIG_RC3, 'rc4': CONFIG_RC4, 'rc1t': CONFIG_RC1T}     # V35_RARE_CONFIG
+RARE_CONFIGS = {'rc3': CONFIG_RC3, 'rc4': CONFIG_RC4, 'rc1t': CONFIG_RC1T, 'rc2t': CONFIG_RC2T}     # V35_RARE_CONFIG
 RUNNERS = ('sync', 'async')
 STOP_PREFIX = 'v35_repetition: '
 SUMMARY_EVERY_S = 10.0
@@ -75,12 +76,12 @@ def settings(env):
     rare_name = env.get('V35_RARE_CONFIG', 'rc3')
     if rare_name not in RARE_CONFIGS:
         raise ValueError(f'V35_RARE_CONFIG={rare_name!r}: expected one of {tuple(RARE_CONFIGS)}')
-    rare_token_only = rare_name == 'rc1t'
+    rare_token_only = rare_name in ('rc1t', 'rc2t')
     if rare_token_only and rare == 'collect':
-        raise ValueError('V35_RARE=collect is for logprob configs; rc1t uses token ids directly (use shadow or off)')
+        raise ValueError(f'V35_RARE=collect is for logprob configs; {rare_name} uses token ids directly (use shadow or off)')
     trace = int(env.get('V35_RARE_TRACE', '0') or 0)
     if rare_token_only and rare != 'off' and trace:
-        raise ValueError('V35_RARE_TRACE records logprobs and is not available with rc1t')
+        raise ValueError(f'V35_RARE_TRACE records logprobs and is not available with {rare_name}')
     table = env.get('V35_DETECTOR_TABLE')
     if not table and (mode != 'off' or rare == 'shadow'):
         raise ValueError('V35_DETECTOR_TABLE is required (qwen3 | glm | dsv4 | path to a .npz table)')
@@ -96,13 +97,15 @@ def settings(env):
         det = RepDetector(table, s['config'], think_end)     # fails now on a bad table, think_end or config
         s['think_end'] = det.think_end
     if rare == 'shadow':
-        if table not in THINK_END and not (rare_token_only and table.endswith('.npz')):
+        if rare_name != 'rc2t' and table not in THINK_END and not (rare_token_only and table.endswith('.npz')):
             raise ValueError(f'V35_RARE needs a shipped table in V35_DETECTOR_TABLE ({" | ".join(THINK_END)}), got {table!r}: '
                              'rare_chars also needs the model\'s rare and reference tables')
         if s['think_end'] == 'auto' and table in THINK_END:
             s['think_end'] = THINK_END[table]
-        if runner == 'sync' or rare_token_only:          # async rc1t must fail before its worker can disable both detectors
+        if runner == 'sync' or rare_token_only:          # async rc1t/rc2t must fail before its worker can disable both detectors
             detector = RareDetector(table, s['rare_config'], s['think_end'])
+            if mode == 'off':
+                s['think_end'] = detector.think_end
             s['rare_neutral'] = bool(rare_token_only and detector.ref.get('neutral', False))
     return s
 

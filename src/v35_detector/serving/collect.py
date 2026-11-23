@@ -169,4 +169,4 @@ class Collector:
 
 MODE = os.environ.get('V35_RARE', 'off')
 CONFIG = os.environ.get('V35_RARE_CONFIG', 'rc3')
-SAMPLER = Collector() if MODE in ('collect', 'shadow') and CONFIG != 'rc1t' else None
+SAMPLER = Collector() if MODE in ('collect', 'shadow') and CONFIG not in ('rc1t', 'rc2t') else None

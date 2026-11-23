@@ -3,7 +3,7 @@
   "repo": "detector_v35",
   "commit": "9d972bec76da2af8e2cd3553dfa713f04914b2ab",
   "dir": "detector/",
-  "note": "rare_chars rc3 (rare*.py, configs/rc3.json, tables/*_rare.npz, *_rcref.npz, rc3_gb.npz) was copied from the research working tree before it was committed; these are the files frozen by sha256 for rc3's one-shot holdout / external run (research runs/holdout_ledger.jsonl, 2026-10-22). rc4 (configs/rc4.json, tables/rc4_gb.npz, the gate / ref keys in rare.py and load_cats in rare_ref.py) is research commit 5118334, dev only. rc1t (configs/rc1t.json and tables/rc1t_ctx_*.npz) is the frozen token-only candidate in vllm_stability_monitor_evolution_aro_1030/deliverable_v2 (detector be54a279dd83fe38999cfb63d052a153ae7916a89027b618d43921c97559205f), not a release described by the research commit above; its online input and model contain no logprobs, while its static tables retain dev-trained state. The reference alerts in detector_v35/runs/rc1t_* came from that repo's uncommitted rc1t adapter working tree, not from the research commit above; the frozen 1030 detector and table hashes are the provenance anchor."
+  "note": "rare_chars rc3 (rare*.py, configs/rc3.json, tables/*_rare.npz, *_rcref.npz, rc3_gb.npz) was copied from the research working tree before it was committed; these are the files frozen by sha256 for rc3's one-shot holdout / external run (research runs/holdout_ledger.jsonl, 2026-10-22). rc4 (configs/rc4.json, tables/rc4_gb.npz, the gate / ref keys in rare.py and load_cats in rare_ref.py) is research commit 5118334, dev only. rc1t (configs/rc1t.json and tables/rc1t_ctx_*.npz) is the frozen token-only candidate in vllm_stability_monitor_evolution_aro_1030/deliverable_v2 (detector be54a279dd83fe38999cfb63d052a153ae7916a89027b618d43921c97559205f), not a release described by the research commit above; its online input and model contain no logprobs, while its static tables retain dev-trained state. The reference alerts in detector_v35/runs/rc1t_* came from that repo's uncommitted rc1t adapter working tree, not from the research commit above; the frozen 1030 detector and table hashes are the provenance anchor. rc2t (configs/rc2t.json, tables/rc2t_model.npz, rc2t_vocab.py) is the tokenizer-agnostic token-only rare_chars detector using universal Unicode character priors and stdlib charset rarity tiers (21-input GBDT, no per-tokenizer corpus count tables), anchored by tests/fixtures/rc2t_golden.json."
  },
  "sha256": {
   "configs/m4.json": "0f8011c9debe8f57512306f11600dfb14cbc99e457c2810840ee54047f3755f2",
@@ -23,6 +23,8 @@
   "tables/rc1t_ctx_qwen3.npz": "61e89cb04d1968f4cbd8be1d36e36cea2800909772ffbcbe5b64f83099e7832c",
   "tables/rc1t_ctx_glm.npz": "eb07023e0f59dc86bbe74d96145f839b596cdf3804606a0ffe90a03e7ae86cce",
   "tables/rc1t_ctx_dsv4.npz": "26d8d293b4fd2f7a696e66b045db5e65994ed4f7a68fcf37838561be93599ef0",
+  "configs/rc2t.json": "3cf4dcf5a1df6edc12825858d4327c504dcb21945ad20d2313dbb44fc6f20623",
+  "tables/rc2t_model.npz": "3bf0f708d36d5a232b47936cd1cea5e4b638e44ef32b593f7fcc374854e9b35a",
   "core.py": "b92107a837a7f6f9b1c0b6633bdeae2e069caff58d9386858271417007a32cd8",
   "offline.py": "e734f0f1d5c77cc2f624f86bb032efda4a76364038437232b12a0651fa8a5cf7",
   "trees.py": "382732196d2059a9c15b0a174101c0210a010a40cd1cae0a9997c12b62e1761a",
@@ -31,7 +33,8 @@
  "edited": {
   "stream.py": "module docstring; RepDetector.__init__ accepts a .npz table path (think_end must then be given)",
   "vocab.py": "tokenizer paths from the command line instead of the research repo; load() accepts a .npz path",
-  "rare.py": "module docs and package table paths; rc1t token-only feed/state, 15-input GB mapping, frozen ctx loading, and reason formatting; custom .npz table paths for non-ctx configurations; external RC1T bundles reuse the frozen GB with explicit boundaries",
+  "rare.py": "module docs and package table paths; rc1t token-only feed/state, 15-input GB mapping, frozen ctx loading, and reason formatting; rc2t 21-input universal Unicode-prior + stdlib codec GB mapping and out-of-the-box tokenizer target loading; custom .npz table paths for non-ctx configurations; external RC1T bundles reuse the frozen GB with explicit boundaries",
+  "rc2t_vocab.py": "tokenizer-agnostic vocabulary parser (ByteLevel BPE, SentencePiece Metaspace/ByteFallback/Unigram, WordPiece, Tiktoken, HF Tokenizer objects) and universal Unicode-prior + stdlib codec mapper for rc2t",
   "rare_vocab.py": "relative imports; tokenizer path from the command line; load() accepts a .npz path",
   "rare_ref.py": "relative imports; the table builder (needs labelled research data) removed; load_cats for rc4; new load_ctx adapter validates rc1t tokenizer/boundary and supplies neutral references without counts; validate context shapes and expose neutral-reference status"
  }

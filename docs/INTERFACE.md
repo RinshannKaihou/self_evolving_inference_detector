@@ -1,6 +1,6 @@
-# 接口说明：v35 检测器（循环输出 m4、乱码监控 rc3 / rc4 / rc1t）
+# 接口说明：v35 检测器（循环输出 m4、乱码监控 rc3 / rc4 / rc1t / rc2t）
 
-版本 0.5.0。判定逻辑、配置与静态表的来源及 SHA-256 见 `src/v35_detector/MANIFEST.json`。§1–§8 是循环输出检测器 m4；§9 是 rare_chars（rc3 的接口与在线监控，rc4 / rc1t 见 §9.8 / §9.9）。
+版本 0.6.0。判定逻辑、配置与静态表的来源及 SHA-256 见 `src/v35_detector/MANIFEST.json`。§1–§8 是循环输出检测器 m4；§9 是 rare_chars（rc3 的接口与在线监控，rc4 / rc1t / rc2t 见 §9.8 / §9.9 / §9.11）。
 
 ## 1. 适用范围
 
@@ -132,10 +132,10 @@ m4 的 14 个组件，以及 `reason` 的字符串：
 | 变量 | 取值 | 默认 |
 |---|---|---|
 | `V35_DETECTOR` | m4：`off` / `shadow`（只检测、记日志）/ `intercept`（检测、记日志并结束请求） | `off` |
-| `V35_RARE` | rare_chars：`off` / `collect`（rc3/rc4 只采集并记覆盖）/ `shadow`（只检测、记日志，没有拦截模式）。rc1t 只支持 off/shadow，不需要采样器采集，见 §9.9 | `off` |
-| `V35_RARE_CONFIG` | `rc3` / `rc4` / `rc1t`。rc3/rc4 使用采样器采集的 logprob；rc1t 只读 token id 并禁用采集 | `rc3` |
-| `V35_RARE_TRACE` | N > 0 时，每个请求前 N 个 token 收到的 logprob 写进 `rare_trace` 事件；只适用于 rc3/rc4，不适用于 rc1t | `0` |
-| `V35_DETECTOR_TABLE` | `qwen3` / `glm` / `dsv4` / `.npz` 路径（m4 词表）；rare_chars 只接受内置名 | m4 开启或 `V35_RARE=shadow` 时必填（只 `collect` 时不需要） |
+| `V35_RARE` | rare_chars：`off` / `collect`（rc3/rc4 只采集并记覆盖）/ `shadow`（只检测、记日志，没有拦截模式）。rc1t/rc2t 只支持 off/shadow，不需要采样器采集，见 §9.9 / §9.11 | `off` |
+| `V35_RARE_CONFIG` | `rc3` / `rc4` / `rc1t` / `rc2t`。rc3/rc4 使用采样器采集的 logprob；rc1t/rc2t 只读 token id 并禁用采集 | `rc3` |
+| `V35_RARE_TRACE` | N > 0 时，每个请求前 N 个 token 收到的 logprob 写进 `rare_trace` 事件；只适用于 rc3/rc4，不适用于 rc1t/rc2t | `0` |
+| `V35_DETECTOR_TABLE` | `qwen3` / `glm` / `dsv4` / `.npz` 路径（m4 词表）；rc1t 支持外部 `.npz` bundle；rc2t 还支持直接传 `tokenizer.json` 或模型目录 | m4 开启或 `V35_RARE=shadow` 时必填（只 `collect` 时不需要） |
 | `V35_DETECTOR_THINK_END` | `auto` / `none` / token id（两个检测器共用）。rc1t 的 Qwen3/GLM 必须与冻结表记录的 id 一致，DSV4 使用 `none`（chat）；sync/async 都在启动配置阶段校验 | `auto` |
 | `V35_DETECTOR_RUNNER` | `sync`（在输出处理循环里算）/ `async`（独立检测进程）；两个检测器在同一处算 | `sync` |
 | `V35_DETECTOR_CONFIG` | m4 配置 JSON 路径（rare_chars 使用内置配置） | 内置 m4 |
@@ -397,3 +397,18 @@ V35_DETECTOR_RUNNER=sync vllm serve ...
 m4 列沿用原构表语义，部分非特殊 added token 会作为不透明片段处理；RC1T 则使用解码字节。
 因此对新增 token，二者的类别处理不保证相同。导出依赖本机 Unicode 数据版本；版本记录用于
 追溯，不意味着跨 Python/Unicode 版本构表结果必然逐字段一致。冻结内置表保持不变。
+
+### 9.11 rc2t（`CONFIG_RC2T`，0.6.0）：跨分词器免参照的 token-only rare_chars
+
+rc2t 是 token-only `rare_chars` 检测器第 2 版（配置 `configs/rc2t.json`，模型 `tables/rc2t_model.npz`，加载与映射逻辑 `rc2t_vocab.py`）。
+
+- **在线输入**：仅读取生成的 `token_ids`，不采集 logprob，不创建采样器 Collector；与 rc1t 一样仅支持 `V35_RARE=shadow`（拒绝 `collect` 与 `V35_RARE_TRACE`）。
+- **免按词表统计的参照表（`"ref": "uni"`）**：以通用 Unicode 字符一元/邻接转移先验 + Python 标准库国家字符集稀有度分层（GB2312/Big5/GBK/EUC-KR/ISO-8859/TIS-620 等）构成 21 维输入、65 棵树的 GBDT，在加载目标词表时动态映射，不再依赖按模型构建的 `*_rcref.npz` 或 `rc1t_ctx_*.npz`。
+- **规则**：严格档为 `bad_utf8` 与 `gb>3.85 & letter`；监控档追加 `fs<0.01 & fsw<0.05 & caseless_after_latin`、`fs<0.01 & answer & caseless_after_latin` 与 `gb>2.70 & letter`。门控固定 `"gate": "fs"`，同样晚 1 个 token 触发。
+- **开箱即用输入目标**：`RareDetector(target, CONFIG_RC2T, think_end='auto')` 支持 5 类输入目标：
+  1. 内置名（`qwen3` / `glm` / `dsv4`）；
+  2. `.npz` 预计算 bundle（可选通过 `python -m v35_detector.rc2t_vocab --tokenizer ... --out ... [--include-m4]` 导出）；
+  3. HuggingFace `tokenizer.json`（纯 Python 解析 ByteLevel BPE、SentencePiece Metaspace/ByteFallback/Unigram、WordPiece）；
+  4. 本地模型目录（优先读 `tokenizer.json` + `tokenizer_config.json`，否则回退 `AutoTokenizer`）；
+  5. 内存分词器对象（`tokenizers.Tokenizer`、`PreTrainedTokenizerFast`、`tiktoken.Encoding`、`SentencePieceProcessor` 或 `get_vocab()` 对象）。
+- **验证与一致性**：`tests/fixtures/rc2t_golden.json` 冻结了 Qwen3 / GLM / DSV4 的报警与 GB 分数金标；`tests/test_rc2t.py` 覆盖流式 = 离线等价、状态有界（`< 8 KB`）、多分词器家族解析与 `sync`/`async` 在线钩子。

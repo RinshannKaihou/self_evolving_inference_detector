@@ -55,7 +55,7 @@ import os
 
 import numpy as np
 
-from . import rare_ref
+from . import rare_ref, rc2t_vocab
 from .rare_gb import GB
 from .rare_vocab import CI, LETTERS, classify, load as load_rare
 from .stream import Result
@@ -73,6 +73,8 @@ REF = ('u', 'jp', 'jn', 'cp', 'cn')
 GB_INPUTS = ['lp1', 'lpc', 'gap', 'cls', 'pcls', 'ncls', 'first', 'last', 'lead', 'pcat', 'ncat', 'fs', 'fsw', 'answer', 'bad_utf8',
              'u', 'cp', 'cn']
 GB_INPUTS_TOKEN_ONLY = [k for k in GB_INPUTS if k not in ('lp1', 'lpc', 'gap')]
+GB_INPUTS_RC2T = ['cls', 'pcls', 'ncls', 'first', 'last', 'lead', 'pcat', 'ncat', 'fs', 'fsw', 'answer', 'bad_utf8',
+                  'u', 'u_mean', 'cp', 'cn', 'c_max', 'c_mean', 'c_len', 'c_rare', 'c_nscripts']
 GB_CAT = ['cls', 'pcls', 'ncls', 'first', 'last', 'pcat', 'ncat']   # categorical inputs (integer codes; -1 -> 31)
 GB_GATE = {'fs': 0.05, 'c': rare_ref.GATE_C}         # gb is scored where fs < 0.05 (a letter of a minority class), bad_utf8,
                                                       # cp < -2.5 or cn < -2.5
@@ -333,15 +335,21 @@ def gb_gate(F):
 
 
 _TOKF = ('cls', 'first', 'last', 'lead', 'u')
+_TOKF_RC2T = ('cls', 'first', 'last', 'lead', 'u', 'u_mean', 'c_max', 'c_mean', 'c_len', 'c_rare', 'c_nscripts')
 
 
 def _tokf(T, ref):
-    """per-token inputs in one table (cached in the reference dict): rcls, first, last, lead, u; the extra last row (index -1, no
-    neighbour) has class code 31"""
+    """per-token inputs in one table (cached in the reference dict); the extra last row (index -1, no neighbour) has class code 31"""
     if '_tokf' not in ref:
         V = len(T['rcls'])
-        tf = np.zeros((V + 1, len(_TOKF)))
-        tf[:V] = np.column_stack([T['rcls'], T['first'], T['last'], T['lead'], ref['u'][:V] if 'u' in ref else np.zeros(V)])
+        if 'u_mean' in ref:
+            tf = np.zeros((V + 1, len(_TOKF_RC2T)))
+            tf[:V] = np.column_stack([T['rcls'], T['first'], T['last'], T['lead'], ref['u'][:V], ref['u_mean'][:V],
+                                      ref['c_max'][:V], ref['c_mean'][:V], ref['c_len'][:V], ref['c_rare'][:V],
+                                      ref['c_nscripts'][:V]])
+        else:
+            tf = np.zeros((V + 1, len(_TOKF)))
+            tf[:V] = np.column_stack([T['rcls'], T['first'], T['last'], T['lead'], ref['u'][:V] if 'u' in ref else np.zeros(V)])
         tf[V, 0] = 31
         ref['_tokf'] = tf
     return ref['_tokf']
@@ -353,7 +361,9 @@ def gb_inputs(F, idx, quant=0.0, fsw=True):
     tok, prv, nxt, T, ref = F['_ctx']
     tf = _tokf(T, ref)
     has_lp = 'lp1' in F
-    inputs, gbi = (GB_INPUTS, _GBI) if has_lp else (GB_INPUTS_TOKEN_ONLY, _GBI_TOKEN)
+    inputs, gbi = ((GB_INPUTS, _GBI) if has_lp else
+                   (GB_INPUTS_RC2T, _GBI_RC2T) if 'u_mean' in ref else
+                   (GB_INPUTS_TOKEN_ONLY, _GBI_TOKEN))
     if len(idx) == 1:                                    # one position (the common case online): scalar reads
         i = int(idx[0])
         t, pc, nc = int(tok[i]), int(F['pcat'][i]), int(F['ncat'][i])
@@ -389,9 +399,9 @@ def gb_inputs(F, idx, quant=0.0, fsw=True):
     return X
 
 
-def _gb_layout(inputs):
+def _gb_layout(inputs, tokf=_TOKF):
     out = {k: inputs.index(k) for k in inputs}
-    out['tokf'] = [inputs.index(k) for k in _TOKF]
+    out['tokf'] = [inputs.index(k) for k in tokf]
     if 'lp1' in inputs:
         out['prob'] = [inputs.index(k) for k in ('lp1', 'lpc', 'gap')]
     return out
@@ -399,10 +409,12 @@ def _gb_layout(inputs):
 
 _GBI = _gb_layout(GB_INPUTS)
 _GBI_TOKEN = _gb_layout(GB_INPUTS_TOKEN_ONLY)
+_GBI_RC2T = _gb_layout(GB_INPUTS_RC2T, _TOKF_RC2T)
 assert set(GB_INPUTS) == set(_TOKF) | {'pcls', 'ncls', 'pcat', 'ncat', 'cp', 'cn', 'lp1', 'lpc', 'gap', 'fs', 'fsw', 'answer',
                                       'bad_utf8'}
 assert GB_INPUTS_TOKEN_ONLY == ['cls', 'pcls', 'ncls', 'first', 'last', 'lead', 'pcat', 'ncat', 'fs', 'fsw', 'answer', 'bad_utf8',
                                 'u', 'cp', 'cn']
+assert set(GB_INPUTS_RC2T) == set(_TOKF_RC2T) | {'pcls', 'ncls', 'pcat', 'ncat', 'cp', 'cn', 'fs', 'fsw', 'answer', 'bad_utf8'}
 
 
 def features(tok, top1_lp, chosen_lp, T, think_end, state=None, need=(), nxt=None, ref=None, gbm=None, prv=None):
@@ -507,12 +519,6 @@ def _repo_path(path):
 class RareDetector:
     def __init__(self, corpus, config, think_end='auto'):
         self.cfg = json.load(open(config)) if isinstance(config, str) else config
-        if self.cfg.get('ref') == 'ctx' and corpus.endswith('.npz'):
-            rare_ref.validate_bundle(corpus)
-        self.T = load_rare(corpus)
-        if think_end == 'auto' and corpus not in THINK_END:
-            raise ValueError(f"think_end='auto' needs a shipped table ({sorted(THINK_END)}); pass the '</think>' id or None")
-        self.think_end = THINK_END[corpus] if think_end == 'auto' else think_end
         self.input = self.cfg.get('input', 'token_ids_logprobs')
         if self.input not in ('token_ids', 'token_ids_logprobs'):
             raise ValueError('unknown "input"')
@@ -527,9 +533,32 @@ class RareDetector:
         self.look = 'ref' in self.need                   # context features: one token behind the stream
         self.gate = self.cfg.get('gate', 'full')
         ref_kind = self.cfg.get('ref', 'counts')
-        cats, ctx = ref_kind == 'cats', ref_kind == 'ctx'
-        if self.gate not in ('full', 'fs') or ref_kind not in ('counts', 'cats', 'ctx'):
+        cats, ctx, uni = ref_kind == 'cats', ref_kind == 'ctx', ref_kind == 'uni'
+        if self.gate not in ('full', 'fs') or ref_kind not in ('counts', 'cats', 'ctx', 'uni'):
             raise ValueError('unknown "gate" / "ref"')
+        if uni:
+            if not self.token_only or self.gate != 'fs' or 'model' not in self.cfg:
+                raise ValueError('"ref": "uni" needs token_ids input, "gate": "fs" and a "model" bundle')
+            self.T, self.think_end, target_key = rc2t_vocab.resolve_target(corpus, think_end)
+            self.ctx_path = None
+            self.model_path = _repo_path(self.cfg['model'])
+            self.ref = rc2t_vocab.load_uni_ref(target_key, self.T, self.model_path) if self.look else None
+            uses_gb = any(self.has_gb)
+            self.gbm = GB.load(self.model_path, prefix='gb_') if (uses_gb and self.ref is not None) else None
+            if self.gbm is not None:
+                if set(self.gbm.inputs) & {'lp1', 'lpc', 'gap'}:
+                    raise ValueError('a token-only model cannot use lp1 / lpc / gap')
+                cols = [GB_INPUTS_RC2T.index(k) for k in self.gbm.inputs]
+                self.gbm.cols = None if cols == list(range(len(GB_INPUTS_RC2T))) else np.array(cols)
+                self.gbm.uses_fsw = 'fsw' in self.gbm.inputs
+                self.gbm.gate = self.gate
+            return
+        if ctx and corpus.endswith('.npz'):
+            rare_ref.validate_bundle(corpus)
+        self.T = load_rare(corpus)
+        if think_end == 'auto' and corpus not in THINK_END:
+            raise ValueError(f"think_end='auto' needs a shipped table ({sorted(THINK_END)}); pass the '</think>' id or None")
+        self.think_end = THINK_END[corpus] if think_end == 'auto' else think_end
         if cats and (self.gate != 'fs' or any(a['f'] in REF for r in self.rules for a in r['and'])):
             raise ValueError('"ref": "cats" needs "gate": "fs" and no rule on a reference feature')
         if ctx and (not self.token_only or self.gate != 'fs' or 'ctx' not in self.cfg):

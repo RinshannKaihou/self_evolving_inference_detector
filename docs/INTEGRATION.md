@@ -425,6 +425,7 @@ V35_DETECTOR_EVENTS=/var/log/v35-events.jsonl vllm serve ...
 
 - 仅开 rc2t（`V35_DETECTOR=off`）时可直接传 `tokenizer.json` 或模型目录，且 `V35_DETECTOR_THINK_END=auto` 会自动探测 `</think>` 等标记；
 - 若同时开启循环检测（`V35_DETECTOR=shadow|intercept`），需传内置名或通过 `python -m v35_detector.rc2t_vocab --tokenizer <tokenizer.json> --out <bundle>.npz --include-m4` 导出包含 m4 列的 `.npz` bundle。
+- 0.7.0 起在线钩子默认启用 `V35_DETECTOR_CONFIG=m4_1` 与 `V35_DETECTOR_TOOL_CALL=exclude`，对循环检测和 `rare_chars`（含 `rc3`/`rc4`/`rc1t`/`rc2t`）同时生效；如需回退到历史行为，可显式设置 `V35_DETECTOR_CONFIG=m4` 与 `V35_DETECTOR_TOOL_CALL=off`。
 
 ### 10.8 新模型
 

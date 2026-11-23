@@ -26,7 +26,8 @@ Environment, read when this module is imported (a misconfiguration stops the ser
   V35_DETECTOR_THINK_END  auto (default; shipped tables only) | none (chat mode) | the '</think>' token id
   V35_DETECTOR_RUNNER     sync (default: inside the output-processing loop) | async (a separate detector process); both
                           detectors run in the same place
-  V35_DETECTOR_CONFIG     m4 config JSON (default: the shipped m4); rare_chars uses the selected shipped config
+  V35_DETECTOR_CONFIG     m4_1 (default) | m4 | path to a repetition config JSON; rare_chars uses the selected shipped config
+  V35_DETECTOR_TOOL_CALL  exclude (default: auto-skip tool-call spans in both repetition and rare_chars) | off (detect inside tool calls)
   V35_DETECTOR_EVENTS     JSONL of alerts (m4: 'alert', rare_chars: 'rare_alert'), interceptions, errors, finished requests and
                           summaries (default ./v35-detector-events.jsonl)
 
@@ -46,7 +47,7 @@ from collections import Counter
 
 import numpy as np
 
-from .. import CONFIG_M4, CONFIG_RC1T, CONFIG_RC2T, CONFIG_RC3, CONFIG_RC4
+from .. import CONFIG_M4, CONFIG_M4_1, CONFIG_RC1T, CONFIG_RC2T, CONFIG_RC3, CONFIG_RC4
 from ..core import BLOCK
 from ..rare import RareDetector
 from ..stream import RepDetector
@@ -55,7 +56,9 @@ from .worker import rare_step, worker_main
 
 MODES = ('off', 'shadow', 'intercept')
 RARE_MODES = ('off', 'collect', 'shadow')                # rare_chars monitors only: there is no intercept mode
+REP_CONFIGS = {'m4': CONFIG_M4, 'm4_1': CONFIG_M4_1}     # shorthand names accepted by V35_DETECTOR_CONFIG
 RARE_CONFIGS = {'rc3': CONFIG_RC3, 'rc4': CONFIG_RC4, 'rc1t': CONFIG_RC1T, 'rc2t': CONFIG_RC2T}     # V35_RARE_CONFIG
+TOOL_CALL_MODES = ('exclude', 'off')                     # V35_DETECTOR_TOOL_CALL
 RUNNERS = ('sync', 'async')
 STOP_PREFIX = 'v35_repetition: '
 SUMMARY_EVERY_S = 10.0
@@ -90,11 +93,18 @@ def settings(env):
     runner = env.get('V35_DETECTOR_RUNNER', 'sync')
     if runner not in RUNNERS:
         raise ValueError(f'V35_DETECTOR_RUNNER={runner!r}: expected one of {RUNNERS}')
+    tool_call = env.get('V35_DETECTOR_TOOL_CALL', 'exclude')
+    if tool_call not in TOOL_CALL_MODES:
+        raise ValueError(f'V35_DETECTOR_TOOL_CALL={tool_call!r}: expected one of {TOOL_CALL_MODES}')
+    tool_spans = 'auto' if tool_call == 'exclude' else None
+    raw_cfg = env.get('V35_DETECTOR_CONFIG')
+    rep_config = CONFIG_M4_1 if not raw_cfg else REP_CONFIGS.get(raw_cfg, raw_cfg)
     s = dict(mode=mode, rare=rare, table=table, think_end=think_end, runner=runner, trace=trace,
-             config=env.get('V35_DETECTOR_CONFIG', CONFIG_M4), rare_config=RARE_CONFIGS[rare_name], rare_name=rare_name,
+             tool_call=tool_call, tool_spans=tool_spans,
+             config=rep_config, rare_config=RARE_CONFIGS[rare_name], rare_name=rare_name,
              rare_token_only=rare_token_only, events=env.get('V35_DETECTOR_EVENTS', './v35-detector-events.jsonl'))
     if mode != 'off':
-        det = RepDetector(table, s['config'], think_end)     # fails now on a bad table, think_end or config
+        det = RepDetector(table, s['config'], think_end, tool_spans=tool_spans)  # fails now on a bad table, think_end or config
         s['think_end'] = det.think_end
     if rare == 'shadow':
         if rare_name != 'rc2t' and table not in THINK_END and not (rare_token_only and table.endswith('.npz')):
@@ -103,7 +113,7 @@ def settings(env):
         if s['think_end'] == 'auto' and table in THINK_END:
             s['think_end'] = THINK_END[table]
         if runner == 'sync' or rare_token_only:          # async rc1t/rc2t must fail before its worker can disable both detectors
-            detector = RareDetector(table, s['rare_config'], s['think_end'])
+            detector = RareDetector(table, s['rare_config'], s['think_end'], tool_spans=tool_spans)
             if mode == 'off':
                 s['think_end'] = detector.think_end
             s['rare_neutral'] = bool(rare_token_only and detector.ref.get('neutral', False))
@@ -112,8 +122,9 @@ def settings(env):
 
 class _SyncRunner:
     def __init__(self, s, on_result):
-        self.det = RepDetector(s['table'], s['config'], s['think_end']) if s['mode'] != 'off' else None
-        self.rare = RareDetector(s['table'], s['rare_config'], s['think_end']) if s['rare'] == 'shadow' else None
+        ts = s.get('tool_spans', 'auto')
+        self.det = RepDetector(s['table'], s['config'], s['think_end'], tool_spans=ts) if s['mode'] != 'off' else None
+        self.rare = RareDetector(s['table'], s['rare_config'], s['think_end'], tool_spans=ts) if s['rare'] == 'shadow' else None
         self.st = {}
         self.rst = {}                                    # rid -> [rare_chars state, monitoring-tier alert reported]
         self.seconds = 0.0
@@ -174,7 +185,8 @@ class _AsyncRunner:
         self.inq, self.outq = ctx.Queue(maxsize=QUEUE_MAX), ctx.Queue()
         self.proc = ctx.Process(target=worker_main, args=(self.inq, self.outq, s['table'],
                                                           s['config'] if s['mode'] != 'off' else None, s['think_end'],
-                                                          s['rare_config'] if s['rare'] == 'shadow' else None),
+                                                          s['rare_config'] if s['rare'] == 'shadow' else None,
+                                                          s.get('tool_spans', 'auto')),
                                 daemon=True, name='v35-detector')
         # spawn re-runs the parent's entry script in the child (for vLLM: its CLI, i.e. torch and all of vLLM); the worker
         # needs only this package, so the entry point is hidden while the child is prepared

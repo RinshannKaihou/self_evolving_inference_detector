@@ -29,7 +29,7 @@ _D = {}
 def _run_m4(a):
     key, corpus, tok = a
     if corpus not in _D:
-        _D[corpus] = RepDetector(corpus, CONFIG_M4)
+        _D[corpus] = RepDetector(corpus, CONFIG_M4, tool_spans=None)
     det = _D[corpus]
     st = det.start()
     res = None
@@ -44,7 +44,7 @@ def _run_m4(a):
 def _run_rare(a):
     name, key, corpus, tok, lp1, lpc = a
     if (name, corpus) not in _D:
-        _D[(name, corpus)] = RareDetector(corpus, RARE[name])
+        _D[(name, corpus)] = RareDetector(corpus, RARE[name], tool_spans=None)
     det = _D[(name, corpus)]
     st = det.start()
     res = None

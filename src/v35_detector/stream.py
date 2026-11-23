@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import core as C
+from . import tool_spans as TS
 from .trees import Trees, inputs
 from .vocab import SEP, THINK_END, load as load_tables
 
@@ -160,7 +161,20 @@ def exact_block(buf, base, end, n_new, pmin, pmax, c):
 
 class State:
     def __init__(self, det):
-        self.t = 0                                       # raw tokens consumed into blocks
+        self.seg_start = 0                               # 0-based raw-token offset of the active non-tool segment
+        self.answer_seen = False                         # sticky across tool-call segment resets
+        self.result = None
+        self.monitor = None                              # first alert of the monitoring tier (any component)
+        self.done = False
+        self.rows = []                                   # probe mode: (t, features)
+        self._tool_state = det._tool_matcher.start() if det._tool_matcher is not None else None
+        self._need_reset = False
+        self._seg_started = False
+        self._init_segment(det, 0)
+
+    def _init_segment(self, det, seg_start):
+        self.seg_start = seg_start
+        self.t = 0                                       # raw tokens consumed into blocks in this segment
         self.pending = np.zeros(0, np.int64)             # tokens not yet forming a full block
         self.streams = {ng: NgramStream(ng, det.need[ng], max(C.WINS)) for ng in det.need}
         self.raw = Ring(det.raw_keep, np.int32) if det.raw_keep else None
@@ -170,7 +184,7 @@ class State:
         for r in (self.sepcum, self.chcum, self.wscum):
             r.append(np.zeros(1, np.int64))
         self.run_char, self.run_len, self.run_max = -1, 0, 0
-        self.answer_at = None                            # normalised position of the first think-end token
+        self.answer_at = 0 if self.answer_seen else None  # normalised position of the first think-end token
         self.nx = 0                                      # normalised positions consumed
         if det.sentences:
             self.cur = []                                            # normalised ids of the open sentence (<= SENT_MAX)
@@ -185,16 +199,14 @@ class State:
             for r in (self.repcum, self.markcum):
                 r.append(np.zeros(1, np.int64))
         self.streak = [0] * len(det.comps)
-        self.result = None
-        self.monitor = None                              # first alert of the monitoring tier (any component)
-        self.done = False
-        self.rows = []                                   # probe mode: (t, features)
 
 
 class RepDetector:
-    def __init__(self, corpus, config=None, think_end='auto'):
+    def __init__(self, corpus, config=None, think_end='auto', tool_spans='auto', think_pairs='auto'):
         """corpus: shipped table name (qwen3 | glm | dsv4) or a .npz built by vocab.py.
-        think_end: token id after which the answer starts ('auto': the shipped table's, vocab.THINK_END; None: chat mode)"""
+        think_end: token id after which the answer starts ('auto': the shipped table's, vocab.THINK_END; None: chat mode).
+        tool_spans: 'auto' (skip known tool-call spans for this tokenizer), None (disable), or explicit [(start, end), ...].
+        think_pairs: 'auto' (protect open <think>..</think> blocks from tool-call skipping), None, or explicit pairs."""
         self.T = load_tables(corpus)
         if think_end == 'auto' and corpus not in THINK_END:
             raise ValueError(f"think_end='auto' needs a shipped table ({sorted(THINK_END)}); pass the '</think>' id or None")
@@ -234,14 +246,14 @@ class RepDetector:
         self.nbits = int(self.T['norm'].max()) + 1
         vs = [c for c in self.comps if c['kind'] == 'V']
         self.raw_keep = max((c['c'] * c['mx'] for c in vs), default=0) + C.BLOCK if vs else 0
+        V = len(self.T['norm'])
+        self.tool_spans, self.think_pairs = TS.resolve_tool_spans(corpus, self.T, tool_spans, think_pairs, vocab_size=V)
+        self._tool_matcher = TS.ToolSpanMatcher(self.tool_spans, self.think_pairs, vocab_size=V) if self.tool_spans else None
 
     def start(self):
         return State(self)
 
-    def feed(self, st, tokens):
-        if st.done:
-            return st.result
-        tok = np.asarray(tokens, np.int64)
+    def _feed_segment(self, st, tok):
         if len(st.pending):
             tok = np.concatenate([st.pending, tok])
         i = 0
@@ -249,12 +261,56 @@ class RepDetector:
             self._block(st, tok[i:i + C.BLOCK])
             i += C.BLOCK
         st.pending = tok[i:].copy() if not st.done else tok[:0]
-        return st.result if st.result is not None and not self.probe else None
 
-    def finish(self, st):
+    def _flush_segment(self, st):
         if not st.done and len(st.pending):
             blk, st.pending = st.pending, st.pending[:0]
             self._block(st, blk)
+
+    def feed(self, st, tokens):
+        if st.done:
+            return st.result
+        tok = np.asarray(tokens, np.int64)
+        if not len(tok):
+            return st.result if st.result is not None and not self.probe else None
+        if self._tool_matcher is None:
+            self._feed_segment(st, tok)
+            return st.result if st.result is not None and not self.probe else None
+        for ev in self._tool_matcher.feed(st._tool_state, tok):
+            if st.done:
+                break
+            if ev[0] == 'break':
+                self._flush_segment(st)
+                if st.t > 0 or st._seg_started:
+                    st._need_reset = True
+            else:
+                _, orig_offset, seg_tok, _, _ = ev
+                if st._need_reset:
+                    st._init_segment(self, orig_offset)
+                    st._need_reset = False
+                    st._seg_started = True
+                elif not st._seg_started:
+                    st.seg_start = orig_offset
+                    st._seg_started = True
+                self._feed_segment(st, seg_tok)
+        return st.result if st.result is not None and not self.probe else None
+
+    def finish(self, st):
+        if not st.done:
+            if self._tool_matcher is not None:
+                for ev in self._tool_matcher.finish(st._tool_state):
+                    if st.done:
+                        break
+                    _, orig_offset, seg_tok, _, _ = ev
+                    if st._need_reset:
+                        st._init_segment(self, orig_offset)
+                        st._need_reset = False
+                        st._seg_started = True
+                    elif not st._seg_started:
+                        st.seg_start = orig_offset
+                        st._seg_started = True
+                    self._feed_segment(st, seg_tok)
+            self._flush_segment(st)
         st.done = True
         return st.result if st.result is not None else Result()
 
@@ -284,6 +340,7 @@ class RepDetector:
             hit = np.flatnonzero(tok == self.think_end)
             if len(hit):
                 st.answer_at = st.nx + int(np.count_nonzero(keep[:hit[0]]))
+                st.answer_seen = True
         for s in st.streams.values():
             s.push(x, st.answer_at)
         if self.lexical:
@@ -364,7 +421,7 @@ class RepDetector:
             return st.streams[int(ng[1:])].share(fl, int(w[1:]))
 
         if self.probe:
-            st.rows.append((t, np.array([val(f) for f in C.FEATS], np.float32)))
+            st.rows.append((st.seg_start + t, np.array([val(f) for f in C.FEATS], np.float32)))
             return
         for i, comp in enumerate(self.comps):
             k = comp['kind']
@@ -395,9 +452,9 @@ class RepDetector:
             st.streak[i] = st.streak[i] + 1 if ok else 0
             if st.streak[i] >= comp.get('S', 1):
                 if st.monitor is None:                   # the monitoring tier includes every component
-                    st.monitor = Result(True, t, describe(comp))
+                    st.monitor = Result(True, st.seg_start + t, describe(comp))
                 if comp.get('tier', 'intercept') != 'monitor' and st.result is None:
-                    st.result = Result(True, t, describe(comp))
+                    st.result = Result(True, st.seg_start + t, describe(comp))
                     st.done = True                       # an intercept alert ends scoring
                     return
 

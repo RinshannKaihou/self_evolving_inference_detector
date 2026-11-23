@@ -18,6 +18,7 @@ import weakref
 
 import numpy as np
 
+from . import tool_spans as TS
 from . import vocab
 from .rare_ref import K, charcat
 from .rare_vocab import CI, classify, kind, load as load_rare, script
@@ -162,7 +163,7 @@ def _iter_steps(node):
         yield node
 
 
-def _tables_from_token_bytes(chunks, special_ids, think_detected=None):
+def _tables_from_token_bytes(chunks, special_ids, think_detected=None, tool_spans=(), think_pairs=()):
     V = len(chunks)
     rcls = np.zeros(V, np.int8)
     first = np.zeros(V, np.int8)
@@ -199,6 +200,8 @@ def _tables_from_token_bytes(chunks, special_ids, think_detected=None):
         'lcat': lcat,
         'bytes': list(chunks),
         'think_detected': think_detected,
+        'tool_spans': tuple(tool_spans),
+        'think_pairs': tuple(think_pairs),
     }
 
 
@@ -295,7 +298,13 @@ def parse_tokenizer_spec(spec, source_name='<tokenizer>', extra_special_ids=()):
             b = p.encode('utf-8')
         chunks.append(b)
 
-    return _tables_from_token_bytes(chunks, special_ids, think_detected=_detect_think_id(piece_to_id))
+    merges = model.get('merges') if isinstance(model, dict) else None
+    spans = TS.detect_tool_spans(piece_to_id, chunks=chunks, merges=merges)
+    thinks = TS.detect_think_pairs(piece_to_id, chunks=chunks)
+    return _tables_from_token_bytes(
+        chunks, special_ids, think_detected=_detect_think_id(piece_to_id),
+        tool_spans=spans, think_pairs=thinks,
+    )
 
 
 def parse_tokenizer_json(tokenizer_json_path, extra_special_ids=()):
@@ -310,6 +319,7 @@ def parse_tokenizer_json(tokenizer_json_path, extra_special_ids=()):
 def _read_dir_special_and_think(model_dir):
     extra_special = set()
     think_id = None
+    cfg_pieces = {}
     cfg_path = os.path.join(model_dir, 'tokenizer_config.json')
     if os.path.isfile(cfg_path):
         try:
@@ -320,11 +330,14 @@ def _read_dir_special_and_think(model_dir):
                 if isinstance(meta, dict):
                     if meta.get('special', False):
                         extra_special.add(tid)
-                    if think_id is None and meta.get('content') in THINK_MARKERS:
-                        think_id = tid
+                    content = meta.get('content')
+                    if isinstance(content, str):
+                        cfg_pieces[content] = tid
+                        if think_id is None and content in THINK_MARKERS:
+                            think_id = tid
         except Exception:
             pass
-    return extra_special, think_id
+    return extra_special, think_id, cfg_pieces
 
 
 def parse_tokenizer_object(tok_obj):
@@ -367,7 +380,11 @@ def parse_tokenizer_object(tok_obj):
         for i in range(V):
             if i not in id_to_bytes:
                 extra_special.add(i)
-        res = _tables_from_token_bytes(chunks, extra_special, think_detected=_detect_think_id(piece_to_id))
+        res = _tables_from_token_bytes(
+            chunks, extra_special, think_detected=_detect_think_id(piece_to_id),
+            tool_spans=TS.detect_tool_spans(piece_to_id, chunks=chunks),
+            think_pairs=TS.detect_think_pairs(piece_to_id, chunks=chunks),
+        )
     # 4. SentencePieceProcessor or slow SentencePiece HF tokenizer
     elif hasattr(tok_obj, 'sp_model') or (hasattr(tok_obj, 'GetPieceSize') and hasattr(tok_obj, 'IdToPiece')):
         sp = getattr(tok_obj, 'sp_model', tok_obj)
@@ -393,7 +410,12 @@ def parse_tokenizer_object(tok_obj):
             else:
                 b = p.replace('\u2581', ' ').encode('utf-8')
             chunks.append(b)
-        res = _tables_from_token_bytes(chunks, extra_special, think_detected=_detect_think_id(piece_to_id))
+        enc_fn = (lambda s: tok_obj.encode(s, add_special_tokens=False)) if hasattr(tok_obj, 'encode') else None
+        res = _tables_from_token_bytes(
+            chunks, extra_special, think_detected=_detect_think_id(piece_to_id),
+            tool_spans=TS.detect_tool_spans(piece_to_id, chunks=chunks, encode_fn=enc_fn),
+            think_pairs=TS.detect_think_pairs(piece_to_id, chunks=chunks),
+        )
     # 5. Generic PreTrainedTokenizerBase / duck-typed get_vocab() object
     elif hasattr(tok_obj, 'get_vocab') and callable(tok_obj.get_vocab):
         vocab_dict = tok_obj.get_vocab()
@@ -431,7 +453,12 @@ def parse_tokenizer_object(tok_obj):
             else:
                 b = p.encode('utf-8')
             chunks.append(b)
-        res = _tables_from_token_bytes(chunks, extra_special, think_detected=_detect_think_id(piece_to_id))
+        enc_fn = (lambda s: tok_obj.encode(s, add_special_tokens=False)) if hasattr(tok_obj, 'encode') else None
+        res = _tables_from_token_bytes(
+            chunks, extra_special, think_detected=_detect_think_id(piece_to_id),
+            tool_spans=TS.detect_tool_spans(piece_to_id, chunks=chunks, encode_fn=enc_fn),
+            think_pairs=TS.detect_think_pairs(piece_to_id, chunks=chunks),
+        )
     else:
         raise ValueError(
             f'unsupported tokenizer target {type(tok_obj).__name__}: expected shipped name, .npz path, '
@@ -528,7 +555,7 @@ def resolve_target(target, think_end='auto'):
     if os.path.isdir(target):
         abspath = os.path.abspath(target)
         tok_json = os.path.join(abspath, 'tokenizer.json')
-        extra_special, cfg_think = _read_dir_special_and_think(abspath)
+        extra_special, cfg_think, cfg_pieces = _read_dir_special_and_think(abspath)
         if os.path.isfile(tok_json):
             mtime = _mtime_ns(tok_json)
             ckey = ('dir_json', abspath, mtime)
@@ -536,6 +563,11 @@ def resolve_target(target, think_end='auto'):
                 T = parse_tokenizer_json(tok_json, extra_special_ids=extra_special)
                 if T['think_detected'] is None and cfg_think is not None:
                     T['think_detected'] = cfg_think
+                if cfg_pieces:
+                    if not T.get('tool_spans'):
+                        T['tool_spans'] = TS.detect_tool_spans(cfg_pieces, chunks=T.get('bytes'))
+                    if not T.get('think_pairs'):
+                        T['think_pairs'] = TS.detect_think_pairs(cfg_pieces, chunks=T.get('bytes'))
                 _TARGET_CACHE[ckey] = T
             T = _TARGET_CACHE[ckey]
             V = len(T['rcls'])
@@ -551,6 +583,11 @@ def resolve_target(target, think_end='auto'):
         T = parse_tokenizer_object(tok_obj)
         if T['think_detected'] is None and cfg_think is not None:
             T['think_detected'] = cfg_think
+        if cfg_pieces:
+            if not T.get('tool_spans'):
+                T['tool_spans'] = TS.detect_tool_spans(cfg_pieces, chunks=T.get('bytes'))
+            if not T.get('think_pairs'):
+                T['think_pairs'] = TS.detect_think_pairs(cfg_pieces, chunks=T.get('bytes'))
         V = len(T['rcls'])
         resolved = T['think_detected'] if think_end == 'auto' else _validate_think_end(think_end, V)
         return T, resolved, ('dir_hf', abspath)
@@ -755,6 +792,11 @@ def build(target, think_end='auto', model_path=None, include_m4=False):
     }
     if 'tokenizer_sha256' in T:
         out['tokenizer_sha256'] = np.array(T['tokenizer_sha256'])
+    spans, thinks = TS.detect_from_table(T)
+    if spans:
+        out['tool_spans_json'] = np.array(TS.serialize_spans(spans))
+    if thinks:
+        out['think_pairs_json'] = np.array(TS.serialize_spans(thinks))
     if include_m4:
         tok_json = target
         if isinstance(tok_json, os.PathLike):

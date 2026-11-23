@@ -89,7 +89,21 @@ def build(tokenizer_json):
             norm[i] = ids.setdefault(key, len(ids) + 1)
             letter[i] = any(c.isalpha() for c in key)
             marker[i] = key in MARKERS
-    return {'norm': norm, 'letter': letter, 'chars': chars, 'ws': ws, 'run_char': run_char, 'marker': marker, 'send': send}
+    from . import tool_spans as TS
+    piece_to_id = {}
+    for i in range(V):
+        piece = tk.id_to_token(i)
+        if piece is not None:
+            piece_to_id[piece] = i
+    enc_fn = lambda text: tk.encode(text, add_special_tokens=False)
+    spans = TS.detect_tool_spans(piece_to_id, encode_fn=enc_fn)
+    thinks = TS.detect_think_pairs(piece_to_id)
+    out = {'norm': norm, 'letter': letter, 'chars': chars, 'ws': ws, 'run_char': run_char, 'marker': marker, 'send': send}
+    if spans:
+        out['tool_spans_json'] = np.array(TS.serialize_spans(spans))
+    if thinks:
+        out['think_pairs_json'] = np.array(TS.serialize_spans(thinks))
+    return out
 
 
 _CACHE = {}

@@ -38,15 +38,15 @@ def rare_step(rare, ent, ids, top1, chosen, last):
     return out
 
 
-def worker_main(inq, outq, table, config, think_end, rare_config=None):
+def worker_main(inq, outq, table, config, think_end, rare_config=None, tool_spans='auto'):
     try:                                                 # shows as 'v35-detector' in ps / psutil (vLLM ships setproctitle)
         import setproctitle
         setproctitle.setproctitle('v35-detector')
     except ImportError:
         pass
     try:
-        det = RepDetector(table, config, think_end) if config is not None else None
-        rare = RareDetector(table, rare_config, think_end) if rare_config is not None else None
+        det = RepDetector(table, config, think_end, tool_spans=tool_spans) if config is not None else None
+        rare = RareDetector(table, rare_config, think_end, tool_spans=tool_spans) if rare_config is not None else None
     except Exception as e:                               # reported to the parent, which fails at start-up
         outq.put(('error', None, f'init: {type(e).__name__}: {e}'))
         return

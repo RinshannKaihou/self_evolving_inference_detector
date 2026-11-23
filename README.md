@@ -1,9 +1,10 @@
-# v35_m4_detector：LLM 推理异常的流式检测器（循环输出 m4、乱码监控 rc3 / rc4 / rc1t / rc2t）
+# v35_m4_detector：LLM 推理异常的流式检测器（循环输出 m4 / m4_1、乱码监控 rc3 / rc4 / rc1t / rc2t）
 
 在 vLLM 生成过程中逐块检查每个请求的输出，发现两类严重异常：
 
-- **循环输出**（taxonomy v3.5 的 `repetition` core）：检测器 **m4**，命中后可以像 stop string 一样立刻结束请求；
+- **循环输出**（taxonomy v3.5 的 `repetition` core）：检测器 **m4_1**（线上默认，较冻结的 **m4** 仅在 `wrep_W2048>=0.99 S24` 上增加新颖度守卫 `N_n4_W512<=0.2`），命中后可以像 stop string 一样立刻结束请求；
 - **乱码**（`rare_chars` core：一眼可见的生僻字乱码，如英文里的西里尔、泰文碎片、非法 UTF-8；纯 ASCII 的碎片不算 core）：默认检测器 **rc3**，也可选 **rc4** 或 token-only **rc1t** / **rc2t**；只监控，报警写进日志，从不结束请求。
+- **工具调用区间排除**（0.7.0 起默认开启，可用 `tool_spans=None` / `V35_DETECTOR_TOOL_CALL=off` 关闭）：按 token id 自动识别并跳过 `tool_call` 区间（支持 Qwen/GLM/DeepSeek/DSML/Kimi-K2/Kimi-K3/Mistral/Llama），同时保护显式 `<think>...</think>` 块且不被工具参数内字面 `</think>` 打断。
 
 检测器的研究来源、冻结哈希和本仓适配改动见 `src/v35_detector/MANIFEST.json`。rc1t 的配置与三张静态表来自 1030 研发环境
 `deliverable_v2`，并非 `detector_v35` 某个发布提交中的文件。`tools/verify_against_research.py` 在全部 19,321 条选型集记录上
@@ -45,6 +46,9 @@
 - **rc2t**（0.6.0）：跨分词器免参照的 token-only rare_chars 检测器第 2 版，用 `V35_RARE=shadow V35_RARE_CONFIG=rc2t` 开启。
   在线只读原始 token id，不创建采样器 Collector；用通用 Unicode 字符先验 + Python 标准库国家字符集稀有度分层（21 维 GBDT，单模型文件 `tables/rc2t_model.npz`）取代按词表统计的 dev 参照计数表。
   支持内置名、`tokenizer.json`（ByteLevel BPE / SentencePiece / WordPiece）、模型目录、`.npz` bundle 以及内存 Tokenizer 对象开箱即用，自动探测 `</think>` 边界；仓内冻结金标 `tests/fixtures/rc2t_golden.json` 与全量 `tests/test_rc2t.py` 通过。
+- **m4_1 与工具调用区间排除**（0.7.0）：针对多模型真实 Agent 会话误报评测（GLM-5.3 / DeepSeek-V4.1 / Kimi-K3）落地两项误报修复：
+  1. 新增 `configs/m4_1.json`（`CONFIG_M4_1`），在 `wrep_W2048 >= 0.99 S=24` 上加入 `nov: N_n4_W512 <= 0.2`，抑制超长上下文词表饱和导致的误报；原 `configs/m4.json` 保持字节冻结；
+  2. 新增 `tool_spans.py`，在 `RepDetector` 与 `RareDetector` 中按 token id 自动跳过 `tool_call` 区间（支持单 token 与多 token 协议、显式 `<think>` 保护、跨区间断缝不拼接、保持原始 1-based `fired_at` 坐标）。在线钩子默认使用 `V35_DETECTOR_CONFIG=m4_1` 且 `V35_DETECTOR_TOOL_CALL=exclude`（可显式设 `m4` 或 `off` 回退）。
 
 ## 版本与线上测试
 
@@ -58,6 +62,7 @@
 | `h20-r4` | 0.4.0 | m4，rc3 与 rc4（`V35_RARE_CONFIG` 切换） | 同 r3 | 已测，原始结果在研究仓 `report/data/h20_20261022_r4/` |
 | 待定 | 0.5.0 | m4、rc3、rc4，新增 token-only rc1t | 同 r3，未增加 | 未测 |
 | 待定 | 0.6.0 | 新增跨分词器 token-only rc2t（通用 Unicode 先验） | 同 r3，未增加 | 未测 |
+| 待定 | 0.7.0 | 新增 `m4_1`（`wrep_W2048` 新颖度守卫）与流式 `tool_call` 区间排除，在线默认启用 | 同 r3，未增加 | 未测 |
 
 ## 安装
 
@@ -70,16 +75,16 @@ pip install -e .            # 依赖只有 numpy；为新模型建词表另需 t
 
 ## 离线用法
 
-循环输出（m4）：
+循环输出（m4_1 / m4）：
 
 ```python
-from v35_detector import RepDetector, CONFIG_M4
+from v35_detector import RepDetector, CONFIG_M4_1
 
-det = RepDetector('qwen3', CONFIG_M4)        # 词表：qwen3 | glm | dsv4，或 vocab.py 生成的 .npz
+det = RepDetector('qwen3', CONFIG_M4_1)      # 词表：qwen3 | glm | dsv4，或 vocab.py 生成的 .npz；默认跳过 tool_call
 st = det.start()                             # 每个请求一份状态
 for ids in stream_of_new_token_ids:          # 任意块大小
     res = det.feed(st, ids)
-    if res is not None:                      # 报警：res.fired_at（已消费 token 数）、res.reason（触发的条件）
+    if res is not None:                      # 报警：res.fired_at（原始 1-based token 位置）、res.reason（触发的条件）
         break
 res = res or det.finish(st)                  # 输出结束时处理最后不满 64 个 token 的一块
 ```
@@ -121,7 +126,8 @@ V35_DETECTOR=shadow V35_RARE=shadow V35_DETECTOR_TABLE=qwen3 \
 ```
 
 - **开关**：
-  - `V35_DETECTOR`（m4）与 `V35_RARE`（rare_chars）见上表；`V35_RARE_CONFIG=rc3|rc4|rc1t|rc2t` 选择乱码配置，默认 rc3；
+  - `V35_DETECTOR`（循环输出）与 `V35_RARE`（rare_chars）见上表；`V35_DETECTOR_CONFIG=m4_1|m4|/path/to.json` 默认 `m4_1`；`V35_RARE_CONFIG=rc3|rc4|rc1t|rc2t` 选择乱码配置，默认 `rc3`；
+  - `V35_DETECTOR_TOOL_CALL=exclude`（默认，自动跳过工具调用区间）或 `off`（关闭跳过，进入工具调用内部检测）；
   - `V35_DETECTOR_RUNNER=sync`（默认，在前端输出处理循环里算）或 `async`（独立检测进程）；
   - `V35_DETECTOR_TABLE` 是词表名，开启任一检测器时必填；`V35_DETECTOR_EVENTS` 是事件日志路径。
 - **撤销**：`--revert`，5 个文件一起撤。不开检测、或不安装本包时，打过补丁的 vLLM 与原版行为相同。
@@ -141,7 +147,8 @@ V35_DETECTOR=shadow V35_RARE=shadow V35_DETECTOR_TABLE=qwen3 \
 
 ```text
 src/v35_detector/       core.py（判据定义）  stream.py（流式检测器）  offline.py（整条记录参照实现）
-                        trees.py  vocab.py（词表）  configs/m4.json  tables/*.npz  MANIFEST.json
+                        tool_spans.py（流式/离线 tool_call 区间排除与协议探测）
+                        trees.py  vocab.py（词表）  configs/{m4,m4_1}.json  tables/*.npz  MANIFEST.json
                         rare.py（rare_chars 检测器）  rare_gb.py（学习打分）  rare_ref.py（参照表）  rare_vocab.py（乱码词表）
                         rc1t_vocab.py（rc1t 外部构表）  rc2t_vocab.py（rc2t 跨分词器解析与先验映射）
                         configs/{rc3,rc4,rc1t,rc2t}.json  tables/*_rare.npz  tables/{qwen3,glm}_rcref.npz

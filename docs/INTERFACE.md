@@ -1,6 +1,6 @@
-# 接口说明：v35 检测器（循环输出 m4、乱码监控 rc3 / rc4 / rc1t / rc2t）
+# 接口说明：v35 检测器（循环输出 m4 / m4_1、乱码监控 rc3 / rc4 / rc1t / rc2t）
 
-版本 0.6.0。判定逻辑、配置与静态表的来源及 SHA-256 见 `src/v35_detector/MANIFEST.json`。§1–§8 是循环输出检测器 m4；§9 是 rare_chars（rc3 的接口与在线监控，rc4 / rc1t / rc2t 见 §9.8 / §9.9 / §9.11）。
+版本 0.7.0。判定逻辑、配置与静态表的来源及 SHA-256 见 `src/v35_detector/MANIFEST.json`。§1–§8 是循环输出检测器 m4 / m4_1（含工具调用区间排除）；§9 是 rare_chars（rc3 的接口与在线监控，rc4 / rc1t / rc2t 见 §9.8 / §9.9 / §9.11）。
 
 ## 1. 适用范围
 
@@ -24,20 +24,22 @@ pip install -e '<仓库路径>[vocab]'  # 为新模型建词表时另需 tokeniz
 ## 3. API
 
 ```python
-from v35_detector import RepDetector, Result, CONFIG_M4
+from v35_detector import RepDetector, Result, CONFIG_M4_1, CONFIG_M4
 
-det = RepDetector(corpus, config=CONFIG_M4, think_end='auto')
+det = RepDetector(corpus, config=CONFIG_M4_1, think_end='auto', tool_spans='auto')
 st  = det.start()                  # 每个请求一份状态
 res = det.feed(st, token_ids)      # 报警时返回 Result，否则 None
 res = det.finish(st)               # 输出结束：处理最后不满 64 个 token 的一块，返回 Result（未报警时 is_ill=False）
-mon = det.monitor(st)              # 监控档的首次报警；m4 没有监控档组件，结果与拦截档相同
+mon = det.monitor(st)              # 监控档的首次报警；m4 / m4_1 没有监控档组件，结果与拦截档相同
 ```
 
 | 参数 | 说明 |
 |---|---|
 | `corpus` | 内置词表名 `qwen3` / `glm` / `dsv4`，或 `vocab.py` 生成的 `.npz` 路径 |
-| `config` | 配置 dict 或 JSON 路径；默认 `CONFIG_M4`；`None` 为探针模式（逐判定点记下全部特征，供分析用） |
+| `config` | 配置 dict 或 JSON 路径；推荐 `CONFIG_M4_1`（或冻结对照 `CONFIG_M4`）；`None` 为探针模式（逐判定点记下全部特征，供分析用） |
 | `think_end` | 回答段起点的 token id（`</think>`）。`'auto'` 只适用于内置词表（qwen3 151668、glm 154842、dsv4 无）；`None` 表示非思考模式 |
+| `tool_spans` | `'auto'`（默认：按词表自动跳过已知 `tool_call` 区间，并在区间边界冲洗/断缝）、`None`（关闭跳过）或显式 `[(start_seq, end_seq_or_None), ...]` |
+| `think_pairs` | `'auto'`（默认：显式 `<think>...</think>` 展开期间不触发 `tool_call` 跳过）、`None` 或显式 `[(think_start, think_end), ...]` |
 
 `Result` 的字段：
 
@@ -66,7 +68,9 @@ mon = det.monitor(st)              # 监控档的首次报警；m4 没有监控�
 - 报警之后状态即结束（`st.done`）：之后再调用 `feed`，返回的仍是同一个 `Result`。
 - `fired_at` 总是判定点（64 的倍数，或 `finish` 时的总长度）。对应的 token 已经生成，所以"报警时已经多生成了多少"以这个数为准。
 
-## 6. 配置（`configs/m4.json`）
+## 6. 配置（`configs/m4_1.json` 与冻结的 `configs/m4.json`）
+
+`configs/m4_1.json`（`CONFIG_M4_1`，0.7.0 起为在线钩子默认配置）仅在组件 #9（`wrep_W2048 >= 0.99 S=24`）上加入新颖度守卫 `nov: {"feat": "N_n4_W512", "max": 0.2}`（其余 13 个组件与冻结的 `configs/m4.json` 完全一致），用于消除超长上下文词表饱和引发的误报。
 
 组件类型：
 
@@ -138,7 +142,8 @@ m4 的 14 个组件，以及 `reason` 的字符串：
 | `V35_DETECTOR_TABLE` | `qwen3` / `glm` / `dsv4` / `.npz` 路径（m4 词表）；rc1t 支持外部 `.npz` bundle；rc2t 还支持直接传 `tokenizer.json` 或模型目录 | m4 开启或 `V35_RARE=shadow` 时必填（只 `collect` 时不需要） |
 | `V35_DETECTOR_THINK_END` | `auto` / `none` / token id（两个检测器共用）。rc1t 的 Qwen3/GLM 必须与冻结表记录的 id 一致，DSV4 使用 `none`（chat）；sync/async 都在启动配置阶段校验 | `auto` |
 | `V35_DETECTOR_RUNNER` | `sync`（在输出处理循环里算）/ `async`（独立检测进程）；两个检测器在同一处算 | `sync` |
-| `V35_DETECTOR_CONFIG` | m4 配置 JSON 路径（rare_chars 使用内置配置） | 内置 m4 |
+| `V35_DETECTOR_CONFIG` | `m4_1` / `m4` 或循环检测配置 JSON 路径（rare_chars 使用内置配置） | `m4_1`（`CONFIG_M4_1`） |
+| `V35_DETECTOR_TOOL_CALL` | `exclude`（按词表自动跳过 `tool_call` 区间，同时作用于循环与乱码检测器）/ `off`（关闭跳过） | `exclude` |
 | `V35_DETECTOR_EVENTS` | 事件日志路径（JSONL） | `./v35-detector-events.jsonl` |
 
 事件日志每行一个 JSON，公共字段为 `ts`、`pid`、`event`：
@@ -189,6 +194,8 @@ mon = det.monitor(st)                                      # 监控档的首次�
 | `corpus` | 内置词表名 `qwen3` / `glm` / `dsv4`，或 `rare_vocab.py` 生成的 `.npz` 路径（此时必须显式给 `think_end`） |
 | `config` | 配置 dict 或 JSON 路径；`CONFIG_RC3` 为内置 rc3 |
 | `think_end` | 同 m4：回答段起点的 token id；`'auto'` 只适用于内置词表；`None` 表示非思考模式 |
+| `tool_spans` | 同 `RepDetector`：`'auto'`（默认自动跳过 `tool_call` 区间，保留累计脚本分布并断开跨区间邻接/UTF-8 状态）、`None` 或显式区间对 |
+| `think_pairs` | 同 `RepDetector`：显式 `<think>...</think>` 保护区间对 |
 | `token_ids` | 生成的 token id，任意块大小 |
 | `top1_logprob` | 每个位置 top-1 候选的 logprob，**自然对数**（vLLM 返回的单位） |
 | `chosen_logprob` | 每个位置生成 token 自己的 logprob，自然对数。vLLM `logprobs=1` 时两者都会返回；在线时由打过补丁的采样器算出（§9.7） |

@@ -55,7 +55,7 @@ import os
 
 import numpy as np
 
-from . import rare_ref, rc2t_vocab
+from . import rare_ref, rc2t_vocab, tool_spans as TS
 from .rare_gb import GB
 from .rare_vocab import CI, LETTERS, classify, load as load_rare
 from .stream import Result
@@ -495,18 +495,20 @@ def needs(rules):
 
 
 class _St:
-    def __init__(self, need=()):
+    def __init__(self, need=(), tool_state=None):
         self.t = 0
         self.f = new_state(need)
         self.result = None
         self.monitor = None
         self.done = False
+        self._tool_state = tool_state
+        self._seg_open = False
 
 
 class _StCtx(_St):
     """state of a config with context features (rc3)"""
-    def __init__(self, need=()):
-        super().__init__(need)
+    def __init__(self, need=(), tool_state=None):
+        super().__init__(need, tool_state)
         self.prev = -1                                   # the last decided token, and the token not yet decided (id, lp1, lpc),
         self.hold = None                                 # which waits for its right neighbour
 
@@ -517,7 +519,7 @@ def _repo_path(path):
 
 
 class RareDetector:
-    def __init__(self, corpus, config, think_end='auto'):
+    def __init__(self, corpus, config, think_end='auto', tool_spans='auto', think_pairs='auto'):
         self.cfg = json.load(open(config)) if isinstance(config, str) else config
         self.input = self.cfg.get('input', 'token_ids_logprobs')
         if self.input not in ('token_ids', 'token_ids_logprobs'):
@@ -552,6 +554,9 @@ class RareDetector:
                 self.gbm.cols = None if cols == list(range(len(GB_INPUTS_RC2T))) else np.array(cols)
                 self.gbm.uses_fsw = 'fsw' in self.gbm.inputs
                 self.gbm.gate = self.gate
+            V = len(self.T['rcls'])
+            self.tool_spans, self.think_pairs = TS.resolve_tool_spans(corpus, self.T, tool_spans, think_pairs, vocab_size=V)
+            self._tool_matcher = TS.ToolSpanMatcher(self.tool_spans, self.think_pairs, vocab_size=V) if self.tool_spans else None
             return
         if ctx and corpus.endswith('.npz'):
             rare_ref.validate_bundle(corpus)
@@ -588,21 +593,25 @@ class RareDetector:
             self.gbm.cols = None if cols == list(range(len(inputs))) else np.array(cols)
             self.gbm.uses_fsw = 'fsw' in self.gbm.inputs
             self.gbm.gate = self.gate
+        V = len(self.T['rcls'])
+        self.tool_spans, self.think_pairs = TS.resolve_tool_spans(corpus, self.T, tool_spans, think_pairs, vocab_size=V)
+        self._tool_matcher = TS.ToolSpanMatcher(self.tool_spans, self.think_pairs, vocab_size=V) if self.tool_spans else None
 
     def start(self):
-        return _StCtx(self.need) if self.look else _St(self.need)
+        tst = self._tool_matcher.start() if self._tool_matcher is not None else None
+        return _StCtx(self.need, tst) if self.look else _St(self.need, tst)
 
-    def feed(self, st, tokens, top1_lp=None, chosen_lp=None):
-        if self.token_only:
-            if top1_lp is not None or chosen_lp is not None:
-                raise ValueError('token-only feed accepts token ids only')
-        elif top1_lp is None or chosen_lp is None:
-            raise ValueError('this config needs top1_lp and chosen_lp')
+    def _feed_segment(self, st, orig_offset, tokens, top1_lp, chosen_lp):
         if st.done or not len(tokens):
-            return st.result
+            return
         if not self.look:
+            st.t = orig_offset
+            st._seg_open = True
             self._step(st, tokens, top1_lp, chosen_lp, None, None, 0)
-            return st.result
+            return
+        if not st._seg_open:
+            st.t = orig_offset
+            st._seg_open = True
         n = len(tokens)
         bt = np.empty(n + 2, np.int64)                   # [previous, held, chunk...]
         if self.token_only:
@@ -625,6 +634,42 @@ class RareDetector:
             st.prev = int(bt[m - 1])
             self._step(st, bt[1:m], None if self.token_only else b1[:m - 1], None if self.token_only else bc[:m - 1],
                        bt[:m - 1], bt[2:m + 1], 1)
+
+    def _break_segment(self, st):
+        if self.look and not st.done and st.hold is not None:
+            h, st.hold = st.hold, None
+            if self.token_only:
+                self._step(st, np.array([h], np.int64), None, None, np.array([st.prev], np.int64), np.array([-1], np.int64), 0)
+            else:
+                self._step(st, np.array([h[0]], np.int64), np.array([h[1]]), np.array([h[2]]), np.array([st.prev], np.int64),
+                           np.array([-1], np.int64), 0)
+        # Disconnect cross-gap neighbor and UTF-8 state only; preserve cumulative counts, ring and answer.
+        if self.look:
+            st.prev = -1
+            st.hold = None
+        st.f['prev_last'] = 0
+        st.f['dec'] = codecs.getincrementaldecoder('utf-8')(errors='replace')
+        st._seg_open = False
+
+    def feed(self, st, tokens, top1_lp=None, chosen_lp=None):
+        if self.token_only:
+            if top1_lp is not None or chosen_lp is not None:
+                raise ValueError('token-only feed accepts token ids only')
+        elif top1_lp is None or chosen_lp is None:
+            raise ValueError('this config needs top1_lp and chosen_lp')
+        if st.done or not len(tokens):
+            return st.result
+        if self._tool_matcher is None:
+            self._feed_segment(st, st.t, tokens, top1_lp, chosen_lp)
+            return st.result
+        for ev in self._tool_matcher.feed(st._tool_state, tokens, top1_lp, chosen_lp):
+            if st.done:
+                break
+            if ev[0] == 'break':
+                self._break_segment(st)
+            else:
+                _, orig_offset, seg_tok, seg_lp1, seg_lpc = ev
+                self._feed_segment(st, orig_offset, seg_tok, seg_lp1, seg_lpc)
         return st.result
 
     def _step(self, st, tokens, top1_lp, chosen_lp, prv, nxt, lag):
@@ -653,6 +698,12 @@ class RareDetector:
         st.t += len(tokens)
 
     def finish(self, st):
+        if not st.done and self._tool_matcher is not None:
+            for ev in self._tool_matcher.finish(st._tool_state, has_lp=not self.token_only):
+                if st.done:
+                    break
+                _, orig_offset, seg_tok, seg_lp1, seg_lpc = ev
+                self._feed_segment(st, orig_offset, seg_tok, seg_lp1, seg_lpc)
         if self.look and not st.done and st.hold is not None:   # the last token: decided at the end of the stream
             h, st.hold = st.hold, None
             if self.token_only:
@@ -681,18 +732,46 @@ def record_features(det, tok, top1_lp=None, chosen_lp=None, ref='auto'):
                     gbm=det.gbm, **ctx)
 
 
-def decide(tok, top1_lp, chosen_lp, corpus, config, think_end='auto', tier='intercept'):
+def decide(tok, top1_lp, chosen_lp, corpus, config, think_end='auto', tier='intercept', tool_spans='auto', think_pairs='auto'):
     """whole-record reference: (fired_at, rule description) of the first alert of a tier, (-1, '') if none. The earliest
-    deciding position wins, ties go to the earlier rule; with look-ahead an alert at position p is raised at min(p + 2, n)."""
-    det = RareDetector(corpus, config, think_end)
-    F = record_features(det, tok, top1_lp, chosen_lp)
+    deciding position wins, ties go to the earlier rule; with look-ahead an alert at position p inside a segment of length m
+    is raised at seg_start + min(p + 2, m)."""
+    det = RareDetector(corpus, config, think_end, tool_spans=tool_spans, think_pairs=think_pairs)
+    tok = np.asarray(tok, np.int64)
     n = len(tok)
-    best, pos = (-1, ''), None
-    for r in det.rules:
-        if tier == 'intercept' and r.get('tier', 'intercept') == 'monitor':
-            continue
-        h = np.flatnonzero(holds(r, F))
-        if len(h) and (pos is None or h[0] < pos):
-            pos = int(h[0])
-            best = (min(pos + 2, n) if det.look else pos + 1, describe(r, det.token_only))
-    return best
+    if det.token_only:
+        if top1_lp is not None or chosen_lp is not None:
+            raise ValueError('token-only features accept token ids only')
+        lp1 = lpc = None
+    else:
+        if top1_lp is None or chosen_lp is None:
+            raise ValueError('this config needs top1_lp and chosen_lp')
+        lp1 = np.asarray(top1_lp, np.float64)
+        lpc = np.asarray(chosen_lp, np.float64)
+
+    segs = det._tool_matcher.split_segments(tok) if det._tool_matcher is not None else ([(0, n)] if n else [])
+    if not segs:
+        return (-1, '')
+    fstate = new_state(det.need)
+    for seg_idx, (s, e) in enumerate(segs):
+        if seg_idx > 0:
+            fstate['prev_last'] = 0
+            fstate['dec'] = codecs.getincrementaldecoder('utf-8')(errors='replace')
+        seg_tok = tok[s:e]
+        m = len(seg_tok)
+        seg_lp1 = None if lp1 is None else lp1[s:e]
+        seg_lpc = None if lpc is None else lpc[s:e]
+        ctx = {'prv': np.r_[-1, seg_tok[:-1]], 'nxt': np.r_[seg_tok[1:], -1]} if det.look else {}
+        F = features(seg_tok, seg_lp1, seg_lpc, det.T, det.think_end, state=fstate, need=det.need,
+                     ref=det.ref, gbm=det.gbm, **ctx)
+        best, pos = (-1, ''), None
+        for r in det.rules:
+            if tier == 'intercept' and r.get('tier', 'intercept') == 'monitor':
+                continue
+            h = np.flatnonzero(holds(r, F))
+            if len(h) and (pos is None or h[0] < pos):
+                pos = int(h[0])
+                best = (s + (min(pos + 2, m) if det.look else pos + 1), describe(r, det.token_only))
+        if best[0] >= 0:
+            return best
+    return (-1, '')

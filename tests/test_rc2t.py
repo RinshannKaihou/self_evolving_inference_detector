@@ -286,3 +286,59 @@ def test_serving_hooks_with_rc2t_tokenizer_json_and_bundle(tmp_path, runner):
         svc.close()
     alerts = [e for e in events(svc) if e['event'] == 'rare_alert']
     assert any(a['tier'] == 'strict' and a['reason'] == 'gb>3.85 & letter' and 'ref' not in a for a in alerts)
+
+
+def test_in_memory_tokenizer_ref_cache_isolated_across_gc():
+    """Repeatedly creating/destroying in-memory tokenizers of different vocab sizes must never collide on reused id(T)."""
+    import gc
+    from v35_detector import rc2t_vocab
+
+    tk = pytest.importorskip('tokenizers')
+
+    def make_tk(n_extra):
+        vocab = {'a': 0, 'b': 1, 'c': 2, 'd': 3}
+        for i in range(n_extra):
+            vocab[f'w{i}'] = 4 + i
+        t = tk.Tokenizer(tk.models.BPE(vocab, []))
+        t.decoder = tk.decoders.ByteLevel()
+        t.pre_tokenizer = tk.pre_tokenizers.ByteLevel(add_prefix_space=False)
+        return t
+
+    class WeakWrapper:
+        def __init__(self, tok):
+            self.backend_tokenizer = tok
+
+    # Same weakrefable live instance reuses its attached ref cache without growing global _REF_CACHE.
+    ref_cache_before = len(rc2t_vocab._REF_CACHE)
+    live_wrap = WeakWrapper(make_tk(4))
+    d_a = RareDetector(live_wrap, CONFIG_RC2T, think_end=None)
+    d_b = RareDetector(live_wrap, CONFIG_RC2T, think_end=None)
+    assert d_a.T is d_b.T and d_a.ref is d_b.ref
+    assert len(rc2t_vocab._REF_CACHE) == ref_cache_before
+    del d_a, d_b, live_wrap
+    gc.collect()
+
+    # Rapidly allocate/free varying-size raw and wrapped tokenizers to force address reuse; ref length must match T.
+    for wrap in (False, True):
+        for step in range(40):
+            t_small = WeakWrapper(make_tk(0)) if wrap else make_tk(0)
+            d1 = RareDetector(t_small, CONFIG_RC2T, think_end=None)
+            assert len(d1.ref['fcat']) == 4
+            st1 = d1.start()
+            d1.feed(st1, [0, 1, 2, 3])
+            d1.finish(st1)
+            del st1, d1, t_small
+            gc.collect()
+
+            n_extra = 6 + (step % 5)
+            t_big = WeakWrapper(make_tk(n_extra)) if wrap else make_tk(n_extra)
+            d2 = RareDetector(t_big, CONFIG_RC2T, think_end=None)
+            expected_v = 4 + n_extra
+            assert len(d2.T['rcls']) == expected_v and len(d2.ref['fcat']) == expected_v
+            st2 = d2.start()
+            d2.feed(st2, [expected_v - 1, expected_v - 2, 0])
+            d2.finish(st2)
+            del st2, d2, t_big
+            gc.collect()
+
+    assert len(rc2t_vocab._REF_CACHE) == ref_cache_before

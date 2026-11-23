@@ -512,7 +512,7 @@ def resolve_target(target, think_end='auto'):
         T = parse_tokenizer_object(target)
         V = len(T['rcls'])
         resolved = T['think_detected'] if think_end == 'auto' else _validate_think_end(think_end, V)
-        return T, resolved, ('obj', id(T))
+        return T, resolved, None
 
     if target in THINK_END:
         T = load_rare(target)
@@ -703,12 +703,20 @@ def compute_uni_ref(T, model_spec):
 
 def load_uni_ref(cache_key, T, model_path):
     model_spec = load_uni_model(model_path)
-    rkey = (cache_key, model_spec['sha256'])
-    if cache_key is not None and rkey in _REF_CACHE:
+    sha = model_spec['sha256']
+    if cache_key is None:
+        # Tie in-memory tokenizer ref cache lifetime to T so GC frees both together and id(T) reuse cannot collide.
+        refs = T.get('_uni_refs')
+        if refs is not None and sha in refs:
+            return refs[sha]
+        ref = compute_uni_ref(T, model_spec)
+        T.setdefault('_uni_refs', {})[sha] = ref
+        return ref
+    rkey = (cache_key, sha)
+    if rkey in _REF_CACHE:
         return _REF_CACHE[rkey]
     ref = compute_uni_ref(T, model_spec)
-    if cache_key is not None:
-        _REF_CACHE[rkey] = ref
+    _REF_CACHE[rkey] = ref
     return ref
 
 

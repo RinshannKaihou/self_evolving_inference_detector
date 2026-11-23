@@ -116,7 +116,11 @@ def test_m4_1_suppresses_vocab_saturation_fp_but_keeps_low_novelty_loop():
     ('dsv4', (128806,), (128807,)),
     ('dsv4', (128808,), (128809,)),
     ('dsv4', (128825, 8701, 4941, 12548), (128825, 8701, 4941, 12548)),
+    ('dsv4', (128825, 72461, 4941, 12548), (128825, 72461, 4941, 12548)),
+    ('dsv4', (128825, 10699), (128825, 10699)),
     ('dsv4', (128840, 8701, 4941, 12548), (128841, 8701, 4941, 12548)),
+    ('dsv4', (128840, 72461, 4941, 12548), (128841, 72461, 4941, 12548)),
+    ('dsv4', (128840, 10699), (128841, 10699)),
 ])
 def test_rep_skips_tool_call_and_preserves_original_fired_at(corpus, start_seq, end_seq):
     loop = make(corpus, 'loop40', 1)
@@ -337,15 +341,18 @@ def test_dynamic_kimi_k3_xtml_mistral_llama_and_dsml_detection(tmp_path):
     llama_spans = TS.detect_tool_spans({'<|python_tag|>': 128010, '<|eom_id|>': 128008})
     assert llama_spans == (((128010,), (128008,)),)
 
-    # 3. DeepSeek DSML BPE merges detection (both string and list merge formats)
-    ds_vocab = {c: i for i, c in enumerate(list('</function_als>'))}
+    # 3. DeepSeek DSML BPE merges detection (V3.2 function_calls, V4 tool_calls, V4.1 ' calls' -> ByteLevel 'Ġcalls')
+    ds_vocab = {c: i for i, c in enumerate(list('</function_als>\u0120'))}
     base = len(ds_vocab)
-    for extra in ('</', 'function', '_calls', '｜DSML｜', '<dsml:', '</dsml:'):
+    for extra in ('</', 'function', 'tool', '_calls', '\u0120calls', '｜DSML｜', '<dsml:', '</dsml:'):
         ds_vocab[extra] = base
         base += 1
     merges_str = [
-        '< /', 'f u', 'fu n', 'fun c', 'func t', 'funct i', 'functi o', 'functio n',
+        '< /',
+        'f u', 'fu n', 'fun c', 'func t', 'funct i', 'functi o', 'functio n',
+        't o', 'to o', 'too l',
         '_ c', '_c a', '_ca l', '_cal l', '_call s',
+        '\u0120 c', '\u0120c a', '\u0120ca l', '\u0120cal l', '\u0120call s',
     ]
     # Add intermediate pieces to vocab
     for m in merges_str:
@@ -356,14 +363,19 @@ def test_dynamic_kimi_k3_xtml_mistral_llama_and_dsml_detection(tmp_path):
     spans_str = TS.detect_tool_spans(ds_vocab, merges=merges_str)
     spans_list = TS.detect_tool_spans(ds_vocab, merges=[m.split(' ') for m in merges_str])
     assert spans_str == spans_list
-    assert len(spans_str) == 2
-    assert spans_str[0] == (
-        (ds_vocab['｜DSML｜'], ds_vocab['function'], ds_vocab['_calls']),
-        (ds_vocab['｜DSML｜'], ds_vocab['function'], ds_vocab['_calls']),
-    )
-    assert spans_str[1] == (
-        (ds_vocab['<dsml:'], ds_vocab['function'], ds_vocab['_calls']),
-        (ds_vocab['</dsml:'], ds_vocab['function'], ds_vocab['_calls']),
+    assert spans_str == (
+        ((ds_vocab['｜DSML｜'], ds_vocab['function'], ds_vocab['_calls']),
+         (ds_vocab['｜DSML｜'], ds_vocab['function'], ds_vocab['_calls'])),
+        ((ds_vocab['<dsml:'], ds_vocab['function'], ds_vocab['_calls']),
+         (ds_vocab['</dsml:'], ds_vocab['function'], ds_vocab['_calls'])),
+        ((ds_vocab['｜DSML｜'], ds_vocab['tool'], ds_vocab['_calls']),
+         (ds_vocab['｜DSML｜'], ds_vocab['tool'], ds_vocab['_calls'])),
+        ((ds_vocab['<dsml:'], ds_vocab['tool'], ds_vocab['_calls']),
+         (ds_vocab['</dsml:'], ds_vocab['tool'], ds_vocab['_calls'])),
+        ((ds_vocab['｜DSML｜'], ds_vocab['\u0120calls']),
+         (ds_vocab['｜DSML｜'], ds_vocab['\u0120calls'])),
+        ((ds_vocab['<dsml:'], ds_vocab['\u0120calls']),
+         (ds_vocab['</dsml:'], ds_vocab['\u0120calls'])),
     )
 
 
@@ -476,3 +488,63 @@ def test_bounded_state_across_many_tool_calls():
         det_rare.feed(st_rare, chunk)
     assert state_bytes(st_rep) <= 256 * 1024
     assert state_bytes(st_rare) < 8 * 1024
+
+
+@pytest.mark.parametrize('runner', ['sync', 'async'])
+@pytest.mark.parametrize('dsml_seq,expected_text', [
+    ((128825, 8701, 4941, 12548), '｜DSML｜function_calls'),
+    ((128825, 72461, 4941, 12548), '｜DSML｜tool_calls'),
+    ((128825, 10699), '｜DSML｜ calls'),
+])
+def test_dsv4_official_v4_and_v41_write_tool_calls_not_intercepted(tmp_path, runner, dsml_seq, expected_text):
+    """Regression: legal DeepSeek V3.2 / V4 (<｜DSML｜tool_calls>) / V4.1 (<｜DSML｜ calls>) Write calls containing
+    a >=500-char repeated divider must NOT be intercepted with run>=500 by default serving hooks."""
+    T_rare = load_rare('dsv4')
+    T_rep = load_rep('dsv4')
+    decoded = b''.join(T_rare['bytes'][i] for i in dsml_seq).decode('utf-8')
+    assert decoded == expected_text
+
+    lt_id = T_rare['bytes'].index(b'<')
+    lt_slash_id = T_rare['bytes'].index(b'</')
+    gt_nl_id = T_rare['bytes'].index(b'>\n')
+    ids = np.arange(len(T_rep['norm']))
+    run_tok = int(ids[(T_rep['run_char'] == ord('=')) & (T_rep['chars'] >= 8)][0])
+    n_run = 600 // int(T_rep['chars'][run_tok]) + 2
+    assert n_run * int(T_rep['chars'][run_tok]) >= 500
+
+    # <｜DSML｜{tag}>\n ... 600x '=' ... </｜DSML｜{tag}>\n
+    stream_tok = np.concatenate([
+        np.array([lt_id, *dsml_seq, gt_nl_id], np.int64),
+        np.repeat(run_tok, n_run),
+        np.array([lt_slash_id, *dsml_seq, gt_nl_id], np.int64),
+    ])
+
+    env_default = {
+        'V35_DETECTOR': 'intercept',
+        'V35_DETECTOR_TABLE': 'dsv4',
+        'V35_DETECTOR_RUNNER': runner,
+        'V35_DETECTOR_EVENTS': str(tmp_path / f'dsv4_{runner}_{dsml_seq[1]}.jsonl'),
+    }
+    svc = hooks.Service(hooks.settings(env_default))
+    try:
+        seen, stop = drive(svc, 'write_ok', stream_tok, None, None, np.random.default_rng(7), with_values=False,
+                           sleep=0.0001 if runner == 'async' else 0.0)
+    finally:
+        svc.close()
+    assert stop is None and seen == len(stream_tok)
+    assert not [e for e in events(svc) if e['event'] in ('alert', 'error')]
+
+    # With V35_DETECTOR_TOOL_CALL=off, the same Write payload fires run>=500.
+    env_off = dict(env_default, V35_DETECTOR_TOOL_CALL='off',
+                   V35_DETECTOR_EVENTS=str(tmp_path / f'dsv4_off_{runner}_{dsml_seq[1]}.jsonl'))
+    svc_off = hooks.Service(hooks.settings(env_off))
+    try:
+        _, stop_off = drive(svc_off, 'write_off', stream_tok, None, None, np.random.default_rng(7), with_values=False,
+                            sleep=0.0002 if runner == 'async' else 0.0)
+    finally:
+        svc_off.close()
+    ev_off = events(svc_off)
+    assert any(e['event'] == 'alert' and e['reason'] == 'run>=500' for e in ev_off)
+    if runner == 'sync' and stop_off is not None:
+        assert stop_off == hooks.STOP_PREFIX + 'run>=500'
+

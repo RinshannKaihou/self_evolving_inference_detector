@@ -32,10 +32,18 @@ SHIPPED_TOOL_SPANS = {
     'dsv4': (
         ((128806,), (128807,)),                                      # <｜tool▁calls▁begin｜> .. <｜tool▁calls▁end｜>
         ((128808,), (128809,)),                                      # <｜tool▁call▁begin｜> .. <｜tool▁call▁end｜>
-        ((128825, 8701, 4941, 12548),                                # ｜DSML｜function_calls (BPE-boundary invariant)
-         (128825, 8701, 4941, 12548)),                               # closing </｜DSML｜function_calls>
-        ((128840, 8701, 4941, 12548),                                # <dsml:function_calls
-         (128841, 8701, 4941, 12548)),                               # </dsml:function_calls
+        ((128825, 8701, 4941, 12548),                                # V3.2: ｜DSML｜function_calls
+         (128825, 8701, 4941, 12548)),
+        ((128840, 8701, 4941, 12548),                                # <dsml:function_calls .. </dsml:function_calls
+         (128841, 8701, 4941, 12548)),
+        ((128825, 72461, 4941, 12548),                               # V4: ｜DSML｜tool_calls
+         (128825, 72461, 4941, 12548)),
+        ((128840, 72461, 4941, 12548),                               # <dsml:tool_calls .. </dsml:tool_calls
+         (128841, 72461, 4941, 12548)),
+        ((128825, 10699),                                            # V4.1: ｜DSML｜ calls (leading space)
+         (128825, 10699)),
+        ((128840, 10699),                                            # <dsml: calls .. </dsml: calls
+         (128841, 10699)),
     ),
 }
 
@@ -72,7 +80,9 @@ SINGLE_THINK_PAIRS = (
     ('<thought>', '</thought>'),
 )
 
-_DSML_PARTS = ('function_calls',)
+# Official DeepSeek DSML container tag names across V3.2 ('function_calls'), V4 ('tool_calls'), and V4.1 (' calls').
+_DSML_TAGS = ('function_calls', 'tool_calls', ' calls')
+_DSML_PARTS = ('function_calls', 'tool_calls', ' calls', '\u0120calls', '\u2581calls')
 _DSML_SUBS = frozenset(
     s[i:j] for s in _DSML_PARTS for i in range(len(s)) for j in range(i + 1, len(s) + 1)
 )
@@ -106,6 +116,11 @@ def _build_dsml_merge_ranks(merges):
 
 
 def _bpe_encode_ascii(text, piece_to_id, merge_ranks):
+    if ' ' in text:
+        if '\u0120' in piece_to_id:
+            text = text.replace(' ', '\u0120')
+        elif '\u2581' in piece_to_id:
+            text = text.replace(' ', '\u2581')
     syms = list(text)
     if any(ch not in piece_to_id for ch in syms):
         return None
@@ -196,26 +211,29 @@ def detect_tool_spans(piece_to_id, chunks=None, merges=None, encode_fn=None):
             add((id_open, id_tools, id_sep), (id_close, id_tools, id_sep))
 
     # DeepSeek DSML multi-token markers: omit outer '<' / '</' / '>' because BPE merges them with adjacent
-    # whitespace/newlines/tags (' <', '></', '>\n', '><'). Matching '｜DSML｜' + bpe('function_calls') and
-    # '<dsml:' / '</dsml:' + bpe('function_calls') is invariant across all BPE boundary contexts.
+    # whitespace/newlines/tags (' <', '></', '>\n', '><'). Matching '｜DSML｜' + tag and '<dsml:' / '</dsml:' + tag
+    # covers V3.2 ('function_calls'), V4 ('tool_calls'), and V4.1 (' calls') across all BPE boundary contexts.
     id_dsml = _lookup_exact(piece_to_id, '｜DSML｜', bytes_to_id)
     id_dsml_open = _lookup_exact(piece_to_id, '<dsml:', bytes_to_id)
     id_dsml_close = _lookup_exact(piece_to_id, '</dsml:', bytes_to_id)
     if id_dsml is not None or (id_dsml_open is not None and id_dsml_close is not None):
         if encode_fn is not None:
-            if id_dsml is not None:
-                seq = _encode_via_fn(encode_fn, '｜DSML｜function_calls')
-                if seq and seq[0] == id_dsml and len(seq) >= 2:
-                    add(seq, seq)
-            if id_dsml_open is not None and id_dsml_close is not None:
-                s_seq = _encode_via_fn(encode_fn, '<dsml:function_calls')
-                e_seq = _encode_via_fn(encode_fn, '</dsml:function_calls')
-                if s_seq and e_seq and s_seq[0] == id_dsml_open and e_seq[0] == id_dsml_close:
-                    add(s_seq, e_seq)
+            for tag in _DSML_TAGS:
+                if id_dsml is not None:
+                    seq = _encode_via_fn(encode_fn, '｜DSML｜' + tag)
+                    if seq and seq[0] == id_dsml and len(seq) >= 2:
+                        add(seq, seq)
+                if id_dsml_open is not None and id_dsml_close is not None:
+                    s_seq = _encode_via_fn(encode_fn, '<dsml:' + tag)
+                    e_seq = _encode_via_fn(encode_fn, '</dsml:' + tag)
+                    if s_seq and e_seq and s_seq[0] == id_dsml_open and e_seq[0] == id_dsml_close:
+                        add(s_seq, e_seq)
         elif merges is not None:
             ranks = _build_dsml_merge_ranks(merges)
-            tail = _bpe_encode_ascii('function_calls', piece_to_id, ranks)
-            if tail is not None:
+            for tag in _DSML_TAGS:
+                tail = _bpe_encode_ascii(tag, piece_to_id, ranks)
+                if tail is None:
+                    continue
                 if id_dsml is not None:
                     seq = (id_dsml,) + tail
                     add(seq, seq)
